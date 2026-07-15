@@ -1,0 +1,35 @@
+# ---- Secrets (NEVER commit) ----
+.dev.vars
+.env
+*.local
+# Gemini keys, Google Drive OAuth secrets etc. live in Wrangler secrets, not git.
+
+# ---- Wrangler / Cloudflare ----
+.wrangler/
+wrangler.toml.bak
+dist/
+
+# ---- Node ----
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json.bak
+
+# ---- Local data / scratch ----
+*.csv
+*.sqlite
+*.db
+tmp/
+scratch/
+
+# NOTE: hotel_filings.json is the one-off D1 seed. Uncomment the next line if you
+# prefer to keep it out of git (it's ~1MB and already loaded into D1).
+# hotel_filings.json
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
