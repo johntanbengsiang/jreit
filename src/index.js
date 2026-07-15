@@ -1,25 +1,3 @@
-// index.js (Cloudflare Worker) — self-updating J-REIT hotel transaction tracker.
-//
-// Stages (each runnable independently so no single invocation times out):
-//   discover  -> pull latest TDnet filings (Yanoshin API) into the queue
-//   triage    -> read PDF, decide if the ACQUIRED/DISPOSED ASSET is a hotel
-//   extract   -> read PDF, pull structured deal fields + review flags
-//
-// Priority: filings whose PDF is still live on TDnet (<=31 days old) are done
-// FIRST, oldest-in-window first (about to expire), then newer, then historical.
-//
-// Routes: /stats, / (table), /api, /export.csv, /discover, /triage, /extract, /run
-//
-// ---------------------------------------------------------------------------
-// PATCH (2026-07): extraction/triage queue no longer stalls on a single bad
-// item. A `break` on any rate-limit-ish error used to kill the whole batch and
-// leave the same poison item at the head of the queue forever. Now we:
-//   * distinguish QUOTA (429 -> stop & resume next run, item stays pending)
-//     from TRANSIENT/poison (503 / parse error -> retry a few times per item)
-//   * count attempts per row (extract_attempts / triage_attempts)
-//   * after MAX attempts, mark the row *_failed so the rest of the queue drains
-// ---------------------------------------------------------------------------
-
 const TRIAGE_BATCH = 10;     // quota is no longer the constraint -> larger batches
 const EXTRACT_BATCH = 6;     // extraction is heavier (big PDF), keep a bit smaller
 const DELAY_MS = 900;        // spacing between Gemini calls (stays under RPM)
