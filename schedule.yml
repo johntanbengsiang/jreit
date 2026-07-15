@@ -1,0 +1,25 @@
+name: Trigger pipeline
+
+# Reliable external cron: pings the Worker so extraction/triage run even if
+# Cloudflare's own Cron Trigger is flaky. GitHub cron is UTC and best-effort.
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes (UTC)
+  workflow_dispatch:          # manual "Run workflow" button for testing
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run extraction + triage
+        run: |
+          curl -sS --fail-with-body \
+            "https://hotel-triage-worker.dispatch-news.workers.dev/run" || true
+      - name: Discover new filings (hourly-ish)
+        if: ${{ github.event.schedule == '*/10 * * * *' }}
+        run: |
+          # only hit /discover when the minute is ~00 to avoid over-calling the API
+          MIN=$(date -u +%M)
+          if [ "$MIN" -lt 10 ]; then
+            curl -sS "https://hotel-triage-worker.dispatch-news.workers.dev/discover" || true
+          fi
