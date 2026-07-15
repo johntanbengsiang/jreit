@@ -1,0 +1,7 @@
+{
+  "name": "hotel-triage-worker",
+  "private": true,
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
