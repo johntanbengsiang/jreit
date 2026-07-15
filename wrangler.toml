@@ -1,0 +1,20 @@
+name = "hotel-triage-worker"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# ---- D1 database binding (matches getDB()'s preferred "DB" name) ----
+[[d1_databases]]
+binding = "DB"
+database_name = "hotel_filings"          # <-- replace with your real D1 database name
+database_id   = "REPLACE_WITH_YOUR_D1_ID" # <-- from `wrangler d1 list`
+
+# ---- Cloudflare's own cron (keep as a second layer alongside GitHub cron) ----
+[triggers]
+crons = ["*/2 * * * *"]   # your scheduled() handler routes by minute (discover/extract/triage)
+
+# NOTE: secrets are NOT stored here. Set them once with:
+#   wrangler secret put GEMINI_API_KEYS
+#   wrangler secret put GDRIVE_CLIENT_ID
+#   wrangler secret put GDRIVE_CLIENT_SECRET
+#   wrangler secret put GDRIVE_REFRESH_TOKEN
+#   wrangler secret put GDRIVE_FOLDER_ID
