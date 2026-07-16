@@ -10,6 +10,15 @@
     "crons": ["*/5 * * * *"]
   },
 
+  // Logging (synced from dashboard). invocation_logs keeps the per-request
+  // summary lines; enabled:false turns OFF persisted/queryable logs.
+  "observability": {
+    "logs": {
+      "enabled": false,
+      "invocation_logs": true
+    }
+  },
+
   // D1 binding. getDB() in index.js accepts "DB" or "hotel_filings_db";
   // we use the real binding + id from your account below.
   "d1_databases": [
