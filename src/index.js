@@ -1,6 +1,6 @@
 const TRIAGE_BATCH = 10;     // quota is no longer the constraint -> larger batches
-const EXTRACT_BATCH = 6;     // extraction is heavier (big PDF), keep a bit smaller
-const DELAY_MS = 900;        // spacing between Gemini calls (stays under RPM)
+const EXTRACT_BATCH = 3;     // extraction is heavier (big PDF), keep a bit smaller
+const DELAY_MS = 300;        // spacing between Gemini calls (stays under RPM)
 const DISCOVER_DAYS = 10;
 const FRESH_WINDOW_DAYS = 31; // TDnet keeps PDFs ~31 days -> full data only here
 const MODEL = "gemini-3.1-flash-lite"; // GA, ~1,000 free req/day, supported to 2027
@@ -59,12 +59,14 @@ export default {
     await ensureTable(env).catch(() => {});
     await ensureColumns(env).catch(() => {});
 
-    if (url.pathname === "/extract") { ctx.waitUntil(processExtractionQueue(env)); return new Response("Extraction batch started.\n"); }
-    if (url.pathname === "/triage")  { ctx.waitUntil(processTriageQueue(env));     return new Response("Triage batch started.\n"); }
+    if (url.pathname === "/extract") { await processExtractionQueue(env); return new Response("Extraction batch done.\n"); }
+    if (url.pathname === "/triage")  { await processTriageQueue(env);     return new Response("Triage batch done.\n"); }
     if (url.pathname === "/run") {
-      ctx.waitUntil((async () => { await processExtractionQueue(env); await processTriageQueue(env); })());
-      return new Response("Extract + triage started.\n");
+      await processExtractionQueue(env);
+      await processTriageQueue(env);
+      return new Response("Extract + triage done.\n");
     }
+
     if (url.pathname === "/discover") { const n = await discoverNewFilings(env); return new Response(`Discovery: inserted ${n}.\n`); }
     if (url.pathname === "/stats")    return statsResponse(env);
 
