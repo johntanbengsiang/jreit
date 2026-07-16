@@ -389,12 +389,21 @@ async function fetchPdfAsBase64(pdfUrl, pubdate) {
   return { base64: await toBase64(res), sourceUrl: pdfUrl };
 }
 
+const MAX_PDF_BYTES = 8 * 1024 * 1024; // 8MB — bigger base64 loops risk the CPU-limit kill
+
 async function toBase64(res) {
   const buf = new Uint8Array(await res.arrayBuffer());
+  // Reject oversized PDFs BEFORE the CPU-heavy loop, so a huge file fails fast
+  // (catchable -> recorded in last_error, and title-only fallback still works)
+  // instead of blowing the isolate's CPU budget and dying with no error.
+  if (buf.length > MAX_PDF_BYTES) {
+    throw new Error(`PDF too large: ${(buf.length / 1048576).toFixed(1)}MB > ${MAX_PDF_BYTES / 1048576}MB`);
+  }
   let binary = "", chunk = 0x8000;
   for (let i = 0; i < buf.length; i += chunk) binary += String.fromCharCode.apply(null, buf.subarray(i, i + chunk));
   return btoa(binary);
 }
+
 
 // ---- Google Drive archiving (optional) -------------------------------------
 function driveConfigured(env) {
