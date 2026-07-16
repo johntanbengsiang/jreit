@@ -1,0 +1,29 @@
+{
+  // Cloudflare Worker config for the J-REIT hotel transaction tracker.
+  "name": "hotel-triage-worker",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-15",
+
+  // Cloudflare's own cron. The scheduled() handler routes by minute
+  // (discover / extract / triage). Keep alongside the GitHub Actions cron.
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+
+  // D1 binding. getDB() in index.js accepts "DB" or "hotel_filings_db";
+  // we use the real binding + id from your account below.
+  "d1_databases": [
+    {
+      "binding": "hotel_filings_db",
+      "database_name": "hotel-filings-db",
+      "database_id": "c1c3e23f-8871-49ee-9309-e9cde7295b9f"
+    }
+  ]
+
+  // NOTE: secrets are NOT stored here. Set them once with:
+  //   wrangler secret put GEMINI_API_KEYS
+  //   wrangler secret put GDRIVE_CLIENT_ID
+  //   wrangler secret put GDRIVE_CLIENT_SECRET
+  //   wrangler secret put GDRIVE_REFRESH_TOKEN
+  //   wrangler secret put GDRIVE_FOLDER_ID
+}
