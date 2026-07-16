@@ -1,12 +1,30 @@
-const TRIAGE_BATCH = 10;     // quota is no longer the constraint -> larger batches
-const EXTRACT_BATCH = 3;     // extraction is heavier (big PDF), keep a bit smaller
-const DELAY_MS = 300;        // spacing between Gemini calls (stays under RPM)
-const DISCOVER_DAYS = 10;
-const FRESH_WINDOW_DAYS = 31; // TDnet keeps PDFs ~31 days -> full data only here
-const MODEL = "gemini-3.1-flash-lite"; // GA, ~1,000 free req/day, supported to 2027
+// index.js (Cloudflare Worker) — self-updating J-REIT hotel transaction tracker.
+//
+// Stages: discover -> triage -> extract. Each runs independently.
+// Routes: /stats, /errors, / (table), /api, /export.csv, /discover, /triage, /extract, /run
+//
+// PATCH LOG
+//  2026-07 (a): queue no longer stalls on one bad item — quota(429) halts the
+//               batch & resumes later; transient(503/parse) retries per-item a
+//               few times then marks *_failed so the queue drains.
+//  2026-07 (b): /extract,/triage,/run now AWAIT the work (fire-and-forget
+//               waitUntil was being cancelled after the fetch response).
+//  2026-07 (c): fetch() timeouts (PDF 20s, Gemini 45s) so one slow request
+//               can't hang the whole awaited batch; EXTRACT_BATCH=1 so an
+//               awaited /extract always finishes fast; last_error recorded +
+//               /errors route to read failures from anywhere.
 
-const MAX_EXTRACT_ATTEMPTS = 4; // give a flaky PDF/Gemini call a few tries, then fail it
+const TRIAGE_BATCH = 6;
+const EXTRACT_BATCH = 1;     // await'd in fetch handler -> 1 at a time is bulletproof
+const DELAY_MS = 300;
+const DISCOVER_DAYS = 10;
+const FRESH_WINDOW_DAYS = 31;
+const MODEL = "gemini-3.1-flash-lite";
+
+const MAX_EXTRACT_ATTEMPTS = 4;
 const MAX_TRIAGE_ATTEMPTS = 4;
+const PDF_TIMEOUT_MS = 20000;
+const GEMINI_TIMEOUT_MS = 45000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -19,10 +37,6 @@ const REIT_CODES = new Set([
   "2979","2989","401A",
 ]);
 
-// Priority ordering (used by both triage & extraction queues):
-//   1. filings within the 31-day fresh window come first (working PDFs)
-//   2. within that window, OLDEST first (closest to expiry -> "31 days ago, move up")
-//   3. everything older: newest first (title-only anyway)
 const PRIORITY_ORDER = `
   ORDER BY (julianday('now') - julianday(pubdate) <= ${FRESH_WINDOW_DAYS}) DESC,
            CASE WHEN julianday('now') - julianday(pubdate) <= ${FRESH_WINDOW_DAYS}
@@ -59,6 +73,7 @@ export default {
     await ensureTable(env).catch(() => {});
     await ensureColumns(env).catch(() => {});
 
+    // AWAIT the work (fire-and-forget waitUntil gets cancelled after response).
     if (url.pathname === "/extract") { await processExtractionQueue(env); return new Response("Extraction batch done.\n"); }
     if (url.pathname === "/triage")  { await processTriageQueue(env);     return new Response("Triage batch done.\n"); }
     if (url.pathname === "/run") {
@@ -66,16 +81,18 @@ export default {
       await processTriageQueue(env);
       return new Response("Extract + triage done.\n");
     }
-
     if (url.pathname === "/discover") { const n = await discoverNewFilings(env); return new Response(`Discovery: inserted ${n}.\n`); }
     if (url.pathname === "/stats")    return statsResponse(env);
-    if (url.pathname === "/errors") { const { results } = await getDB(env).prepare(
-        `SELECT id, reit_name, title, status, extract_attempts, last_error FROM filings
-          WHERE status IN ('extraction_failed','triage_failed') ORDER BY id DESC LIMIT 20`
-      ).all().catch(() => ({ results: [] }));
+
+    if (url.pathname === "/errors") {
+      const { results } = await getDB(env).prepare(
+        `SELECT id, reit_name, title, status, extract_attempts, triage_attempts, last_error
+           FROM filings
+          WHERE status IN ('extraction_failed','triage_failed')
+          ORDER BY id DESC LIMIT 20`
+      ).all().catch((e) => ({ results: [{ query_error: String(e.message || e) }] }));
       return Response.json(results);
     }
-
 
     const { results } = await getDB(env).prepare(
       `SELECT * FROM hotel_transactions ORDER BY pubdate DESC`
@@ -103,14 +120,13 @@ async function ensureTable(env) {
   ).run();
 }
 
-// Add per-row attempt counters to the `filings` queue table if they don't exist.
-// SQLite/D1 has no "ADD COLUMN IF NOT EXISTS", so we just try and swallow the
-// "duplicate column name" error on subsequent runs. Cheap and idempotent.
+// Idempotent column adds (SQLite/D1 has no ADD COLUMN IF NOT EXISTS).
 async function ensureColumns(env) {
   const db = getDB(env);
   for (const col of ["extract_attempts", "triage_attempts"]) {
     await db.prepare(`ALTER TABLE filings ADD COLUMN ${col} INTEGER DEFAULT 0`).run().catch(() => {});
   }
+  await db.prepare(`ALTER TABLE filings ADD COLUMN last_error TEXT`).run().catch(() => {});
 }
 
 async function discoverNewFilings(env) {
@@ -121,7 +137,7 @@ async function discoverNewFilings(env) {
 
   let items = [];
   try {
-    const res = await fetch(api);
+    const res = await fetch(api, { signal: AbortSignal.timeout(PDF_TIMEOUT_MS) });
     if (!res.ok) { console.warn(`Discovery: HTTP ${res.status}`); return 0; }
     items = (await res.json()).items || [];
   } catch (e) { console.warn(`Discovery failed: ${e.message}`); return 0; }
@@ -164,18 +180,15 @@ async function processTriageQueue(env) {
       ).bind(st, r.is_hotel ? 1 : 0, r.confidence, r.reasoning, row.id).run();
       console.log(`  #${row.id} -> ${st} (${r.confidence})`);
     } catch (err) {
-      // QUOTA: global daily/RPM limit -> stop the batch, leave this item pending.
       if (isQuota(err)) { console.warn(`[quota] triage halted at #${row.id}; resume next run.`); break; }
-      // TRANSIENT / poison: count the attempt; retry later unless we've hit the cap.
-      const attempts = (row.extract_attempts || 0) + 1;
+      const attempts = (row.triage_attempts || 0) + 1;
       const msg = String(err && err.message || err).slice(0, 500);
-      await getDB(env).prepare(`UPDATE filings SET extract_attempts=?, last_error=? WHERE id=?`).bind(attempts, msg, row.id).run();
-
+      await getDB(env).prepare(`UPDATE filings SET triage_attempts=?, last_error=? WHERE id=?`).bind(attempts, msg, row.id).run();
       if (isTransient(err) && attempts < MAX_TRIAGE_ATTEMPTS) {
-        console.warn(`[retry-later] triage #${row.id} attempt ${attempts}: ${err.message}`);
-        continue; // don't kill the batch — move on to the next filing
+        console.warn(`[retry-later] triage #${row.id} attempt ${attempts}: ${msg}`);
+        continue;
       }
-      console.error(`Triage failed #${row.id} after ${attempts}: ${err.message}`);
+      console.error(`Triage failed #${row.id} after ${attempts}: ${msg}`);
       await getDB(env).prepare(`UPDATE filings SET status='triage_failed' WHERE id=?`).bind(row.id).run();
     }
     await sleep(DELAY_MS);
@@ -193,8 +206,6 @@ async function processExtractionQueue(env) {
     try {
       const { data, pdfAvailable, base64 } = await extractFiling(row.pdf_url, row.title, env, row.pubdate);
 
-      // Archive the PDF to Google Drive while it's still fresh (only if the PDF
-      // was actually fetched AND Drive is configured). Non-fatal on failure.
       let archiveUrl = null;
       if (base64 && driveConfigured(env)) {
         const name = `${row.pubdate.slice(0,10)}_${row.reit_name}_${(data.property_name_en||data.property_name||row.id)}`
@@ -225,16 +236,15 @@ async function processExtractionQueue(env) {
       const flag = data.needs_review ? " ⚠needs_review" : "";
       console.log(`  #${row.id} extracted: ${data.property_name} (${data.transaction_type})${flag}`);
     } catch (err) {
-      // QUOTA: global daily/RPM limit -> stop the batch, leave this item pending.
       if (isQuota(err)) { console.warn(`[quota] extract halted at #${row.id}; resume next run.`); break; }
-      // TRANSIENT / poison: count the attempt; retry later unless we've hit the cap.
       const attempts = (row.extract_attempts || 0) + 1;
-      await getDB(env).prepare(`UPDATE filings SET extract_attempts=? WHERE id=?`).bind(attempts, row.id).run();
+      const msg = String(err && err.message || err).slice(0, 500);
+      await getDB(env).prepare(`UPDATE filings SET extract_attempts=?, last_error=? WHERE id=?`).bind(attempts, msg, row.id).run();
       if (isTransient(err) && attempts < MAX_EXTRACT_ATTEMPTS) {
-        console.warn(`[retry-later] extract #${row.id} attempt ${attempts}: ${err.message}`);
-        continue; // don't kill the batch — move on to the next filing
+        console.warn(`[retry-later] extract #${row.id} attempt ${attempts}: ${msg}`);
+        continue;
       }
-      console.error(`Extraction failed #${row.id} after ${attempts}: ${err.message}`);
+      console.error(`Extraction failed #${row.id} after ${attempts}: ${msg}`);
       await getDB(env).prepare(`UPDATE filings SET status='extraction_failed' WHERE id=?`).bind(row.id).run();
     }
     await sleep(DELAY_MS);
@@ -291,9 +301,7 @@ async function extractFiling(pdfUrl, title, env, pubdate) {
     "of a mixed-use building; or the price/appraisal is withheld (非開示).\n" +
     "- review_note: one short sentence explaining why review is needed (or why data is sparse).\n" +
     "- property_name: the property name as written in the filing (keep Japanese if that is how it appears).\n" +
-    "- property_name_en: an English translation / romanisation of the property name " +
-    "(e.g. \"A-FLAG 京都四条\" -> \"A-FLAG Kyoto Shijo\"; \"ホテルリブマックス日本橋箱崎\" -> " +
-    "\"Hotel Livemax Nihonbashi Hakozaki\"). Translate/transliterate hotel & place names sensibly.\n\n" +
+    "- property_name_en: an English translation / romanisation of the property name.\n\n" +
     "IMPORTANT: The property-detail table (物件の内容 / 本取得予定資産の内容) and the appraisal " +
     "section (鑑定評価書の概要) contain 延床面積, 取得価格, 鑑定評価額, 還元利回り, 所在地, 取得日 etc. " +
     "Extract EVERY one of these that appears — do not leave a field blank if its value is in the document. " +
@@ -328,7 +336,7 @@ async function callGemini(promptText, pdfUrl, schema, env, pubdate) {
   const keys = getKeys(env);
   if (keys.length === 0) throw new Error("No Gemini API key configured.");
 
-  const fetched = await fetchPdfAsBase64(pdfUrl, pubdate).catch(() => null);
+  const fetched = await fetchPdfAsBase64(pdfUrl, pubdate).catch((e) => { console.warn(`PDF: ${e.message}`); return null; });
   const base64 = fetched?.base64 || null;
 
   const parts = [{ text: promptText }];
@@ -337,8 +345,6 @@ async function callGemini(promptText, pdfUrl, schema, env, pubdate) {
 
   const payload = {
     contents: [{ parts }],
-    // temperature 0 = deterministic + more complete field extraction (default ~1.0
-    // caused the same PDF to return different/partial results run-to-run).
     generationConfig: { responseMimeType: "application/json", responseSchema: schema, temperature: 0 },
   };
 
@@ -348,7 +354,10 @@ async function callGemini(promptText, pdfUrl, schema, env, pubdate) {
     const apiKey = keys[attempt % keys.length];
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
     res = await fetch(url, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
     });
     if (res.ok) break;
     errorText = await res.text();
@@ -365,17 +374,14 @@ async function callGemini(promptText, pdfUrl, schema, env, pubdate) {
 
 // ============================================================================
 async function fetchPdfAsBase64(pdfUrl, pubdate) {
-  // TDnet keeps PDFs ~31 days. Historical filings 404 here; there is no reliable
-  // free raw-PDF mirror, so those fall back to title-only upstream.
-  const res = await fetch(pdfUrl, { redirect: "follow" });
+  const res = await fetch(pdfUrl, { redirect: "follow", signal: AbortSignal.timeout(PDF_TIMEOUT_MS) });
   if (!res.ok) throw new Error(`PDF fetch failed: HTTP ${res.status}`);
   const ct = (res.headers.get("content-type") || "").toLowerCase();
   if (!ct.includes("application/pdf")) {
-    // yanoshin rd.php may hand back HTML if the source PDF is gone
     const html = await res.text();
     const m = html.match(/https?:\/\/[^"'\s)]+\.pdf/i);
     if (!m) throw new Error("No PDF at URL (source expired)");
-    const p = await fetch(m[0], { redirect: "follow" });
+    const p = await fetch(m[0], { redirect: "follow", signal: AbortSignal.timeout(PDF_TIMEOUT_MS) });
     if (!p.ok || !(p.headers.get("content-type") || "").toLowerCase().includes("pdf"))
       throw new Error("Linked PDF unavailable");
     return { base64: await toBase64(p), sourceUrl: m[0] };
@@ -383,21 +389,27 @@ async function fetchPdfAsBase64(pdfUrl, pubdate) {
   return { base64: await toBase64(res), sourceUrl: pdfUrl };
 }
 
+const MAX_PDF_BYTES = 8 * 1024 * 1024; // 8MB — bigger base64 loops risk the CPU-limit kill
+
 async function toBase64(res) {
   const buf = new Uint8Array(await res.arrayBuffer());
+  // Reject oversized PDFs BEFORE the CPU-heavy loop, so a huge file fails fast
+  // (catchable -> recorded in last_error, and title-only fallback still works)
+  // instead of blowing the isolate's CPU budget and dying with no error.
+  if (buf.length > MAX_PDF_BYTES) {
+    throw new Error(`PDF too large: ${(buf.length / 1048576).toFixed(1)}MB > ${MAX_PDF_BYTES / 1048576}MB`);
+  }
   let binary = "", chunk = 0x8000;
   for (let i = 0; i < buf.length; i += chunk) binary += String.fromCharCode.apply(null, buf.subarray(i, i + chunk));
   return btoa(binary);
 }
 
-// ---- Google Drive archiving (optional; only runs if all secrets are set) ---
+
+// ---- Google Drive archiving (optional) -------------------------------------
 function driveConfigured(env) {
   return !!(env.GDRIVE_CLIENT_ID && env.GDRIVE_CLIENT_SECRET &&
             env.GDRIVE_REFRESH_TOKEN && env.GDRIVE_FOLDER_ID);
 }
-
-// Cache the short-lived access token within this isolate to avoid re-minting it
-// on every upload in a batch.
 let _driveToken = { value: null, exp: 0 };
 async function driveAccessToken(env) {
   if (_driveToken.value && Date.now() < _driveToken.exp) return _driveToken.value;
@@ -409,15 +421,13 @@ async function driveAccessToken(env) {
   });
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body,
+    signal: AbortSignal.timeout(PDF_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`Drive token HTTP ${res.status}: ${await res.text()}`);
   const j = await res.json();
   _driveToken = { value: j.access_token, exp: Date.now() + (j.expires_in - 60) * 1000 };
   return _driveToken.value;
 }
-
-// Multipart upload of a base64 PDF into the configured Drive folder.
-// Returns a shareable webViewLink, or throws.
 async function archiveToDrive(env, filename, base64) {
   const token = await driveAccessToken(env);
   const meta = { name: filename, parents: [env.GDRIVE_FOLDER_ID] };
@@ -437,7 +447,7 @@ async function archiveToDrive(env, filename, base64) {
     "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink",
     { method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": `multipart/related; boundary=${boundary}` },
-      body: bodyBuf }
+      body: bodyBuf, signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS) }
   );
   if (!res.ok) throw new Error(`Drive upload HTTP ${res.status}: ${await res.text()}`);
   const j = await res.json();
@@ -445,19 +455,17 @@ async function archiveToDrive(env, filename, base64) {
 }
 
 // ---- Error classification --------------------------------------------------
-// QUOTA errors mean the whole run should stop and try again later (the item is
-// NOT the problem — the account is out of budget/RPM). Do NOT count an attempt.
 function isQuota(err) {
   const code = err?.status ?? err?.statusCode;
   const s = String(err?.message ?? err ?? "");
   return code === 429 || /\b429\b|RESOURCE_EXHAUSTED|Too Many Requests|quota/i.test(s);
 }
-// TRANSIENT errors are per-request (server 5xx / overload / temporary parse).
-// Worth a few retries on the SAME item, then give up so the queue can drain.
 function isTransient(err) {
   const code = err?.status ?? err?.statusCode;
   const s = String(err?.message ?? err ?? "");
-  return code === 500 || code === 503 || /\b50[03]\b|UNAVAILABLE|high demand|overloaded/i.test(s);
+  // include AbortError (timeout) as transient so a slow item retries then fails cleanly
+  return code === 500 || code === 503 ||
+    /\b50[03]\b|UNAVAILABLE|high demand|overloaded|aborted|timeout|The operation was aborted/i.test(s);
 }
 
 // ============================================================================
@@ -491,7 +499,6 @@ function derive(r) {
   const price = Number(r.price_jpy) || null, appraisal = Number(r.appraisal_jpy) || null;
   const rooms = Number(r.num_rooms) || null, gfa = Number(r.gfa_sqm) || null;
   const stake = Number(r.stake_pct) || null;
-  // stake-adjust GFA so price/sqm compares like-for-like when a partial share is bought
   const gfaAdj = (gfa && stake && stake < 100) ? gfa * stake / 100 : gfa;
   return {
     apprPremium: (appraisal && price) ? appraisal / price : null,
@@ -522,8 +529,6 @@ function csvResponse(rows) {
 }
 
 function htmlResponse(rows) {
-  // Enrich each row with derived metrics, then hand the whole dataset to a small
-  // client-side app that renders the map + table and does filtering in the browser.
   const data = rows.map((r) => {
     const d = derive(r);
     return {
@@ -603,9 +608,7 @@ function htmlResponse(rows) {
 <script>
 const DATA = ${json};
 const fmt = v => (v||v===0) ? Number(v).toLocaleString() : "";
-// round to n decimals then drop trailing zeros -> 3.9000000000000004 => "3.9"
 const num = (v,n=2) => (v==null || v==="") ? "" : (+(+v).toFixed(n)).toString();
-// Split the existing "City, Ward" location string (no new column needed).
 function splitLoc(loc){
   if(!loc) return {city:"",ward:""};
   const i = loc.indexOf(",");
@@ -625,7 +628,6 @@ function fillSelect(sel, values){
 }
 const cities = [...new Set(DATA.map(r=>r._city).filter(Boolean))].sort();
 fillSelect(fCity, cities);
-// Ward options depend on which cities are chosen (all cities if none chosen).
 function refreshWards(){
   const cs=selected(fCity);
   const wards=[...new Set(DATA
@@ -688,14 +690,12 @@ function render(rows){
   if(pts.length) map.fitBounds(pts,{padding:[30,30],maxZoom:13});
   renderCharts(rows);
 }
-// ---- Charts (redraw with only the currently-visible rows) ------------------
 let scatterChart, barsChart;
-function quarterOf(d){ // d = "YYYY-MM-DD"
+function quarterOf(d){
   if(!d || d.length<7) return null;
   const y=d.slice(0,4), m=+d.slice(5,7); return y+" Q"+(Math.floor((m-1)/3)+1);
 }
 function renderCharts(rows){
-  // Scatter: price/key (¥m) vs yield (%). Only rows that have BOTH.
   const acq=[], dis=[];
   for(const r of rows){
     if(r.price_per_key==null || r.yield_pct==null) continue;
@@ -713,7 +713,6 @@ function renderCharts(rows){
       plugins:{tooltip:{callbacks:{label:c=>c.raw.label+': '+c.raw.y+'¥m/key, '+c.raw.x+'%'}}},
       scales:{x:{title:{display:true,text:'Yield (%)'}},
               y:{title:{display:true,text:'Price / Key (¥m)'}}}}});
-  // Bars: sum acquisition vs disposal price (¥bn) by quarter.
   const q={};
   for(const r of rows){
     if(!r.price_jpy) continue;
@@ -731,7 +730,6 @@ function renderCharts(rows){
     options:{maintainAspectRatio:false,
       scales:{y:{title:{display:true,text:'¥bn'}}}}});
 }
-// When city selection changes, rebuild ward options first, then re-filter.
 fCity.addEventListener('change', ()=>{ refreshWards(); apply(); });
 ['fType','fWard','fClean','fData','fText'].forEach(id=>{
   document.getElementById(id).addEventListener('input',apply);
