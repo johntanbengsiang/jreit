@@ -13,6 +13,13 @@
 //               can't hang the whole awaited batch; EXTRACT_BATCH=1 so an
 //               awaited /extract always finishes fast; last_error recorded +
 //               /errors route to read failures from anywhere.
+//  2026-07 (d): last_error now stage-tagged ([PDF fetch]/[Gemini call]/...);
+//               Gemini network-level failures (timeouts) retried in-call like
+//               a 503 instead of failing on the first try; *_failed rows are
+//               auto-requeued every ~15min (the discover tick) up to a
+//               lifetime attempt cap instead of sitting stuck forever;
+//               repeated "too large" PDF failures escalate to a stronger,
+//               still-free-tier model with a bigger (riskier) byte cap.
 
 const TRIAGE_BATCH = 6;
 const EXTRACT_BATCH = 1;     // await'd in fetch handler -> 1 at a time is bulletproof
@@ -20,11 +27,30 @@ const DELAY_MS = 300;
 const DISCOVER_DAYS = 10;
 const FRESH_WINDOW_DAYS = 31;
 const MODEL = "gemini-3.1-flash-lite";
+// Used only after repeated "PDF too large" failures on the same filing.
+// gemini-3.5-flash is Google's current non-lite Flash model and is still
+// free-tier eligible as of 2026-07 — but it shares its OWN free-tier RPD
+// bucket, separate from and much smaller than Flash-Lite's, so this is meant
+// as a rare escalation path, not a routine one. Check your live limits at
+// https://aistudio.google.com/rate-limit before leaning on it heavily.
+const MODEL_FALLBACK = "gemini-3.5-flash";
 
-const MAX_EXTRACT_ATTEMPTS = 4;
+const MAX_EXTRACT_ATTEMPTS = 4;    // retries within one burst before flipping to *_failed
 const MAX_TRIAGE_ATTEMPTS = 4;
+// Lifetime ceiling across ALL requeue cycles (see requeueFailedJobs). Once a
+// row's attempts counter hits this, it stays *_failed permanently — check /errors.
+const MAX_EXTRACT_LIFETIME_ATTEMPTS = 10;
+const MAX_TRIAGE_LIFETIME_ATTEMPTS = 10;
 const PDF_TIMEOUT_MS = 20000;
 const GEMINI_TIMEOUT_MS = 45000;
+
+// Both Flash and Flash-Lite share the same 1M-token context — switching
+// models does NOT by itself let a bigger PDF through. This cap is a Workers
+// CPU-safety limit on the base64-encoding loop, not a Gemini limit, so it has
+// to be raised explicitly for an escalated retry to actually do anything.
+const MAX_PDF_BYTES = 8 * 1024 * 1024;            // normal cap
+const MAX_PDF_BYTES_ESCALATED = 16 * 1024 * 1024; // used once escalated — raises CPU-limit-kill risk, watch it
+const TOO_LARGE_ESCALATE_AFTER = 1; // escalate once a "too large" error has happened this many times
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -63,7 +89,7 @@ export default {
     await ensureTable(env);
     await ensureColumns(env);
     const min = new Date().getMinutes();
-    if (min % 15 === 0)      ctx.waitUntil(discoverNewFilings(env));
+    if (min % 15 === 0)      ctx.waitUntil(requeueFailedJobs(env).then(() => discoverNewFilings(env)));
     else if (min % 2 === 0)  ctx.waitUntil(processExtractionQueue(env));
     else                     ctx.waitUntil(processTriageQueue(env));
   },
@@ -82,6 +108,7 @@ export default {
       return new Response("Extract + triage done.\n");
     }
     if (url.pathname === "/discover") { const n = await discoverNewFilings(env); return new Response(`Discovery: inserted ${n}.\n`); }
+    if (url.pathname === "/requeue")  { const n = await requeueFailedJobs(env); return new Response(`Requeued ${n}.\n`); }
     if (url.pathname === "/stats")    return statsResponse(env);
 
     if (url.pathname === "/errors") {
@@ -163,16 +190,35 @@ async function discoverNewFilings(env) {
   return inserted;
 }
 
+// Gives *_failed rows another shot instead of leaving them stuck until
+// someone runs a manual UPDATE. Attempts counters are NOT reset on requeue —
+// they keep accumulating, which is what bounds this to MAX_*_LIFETIME_ATTEMPTS
+// and is also what pickGeminiOpts() reads to decide whether to escalate.
+async function requeueFailedJobs(env) {
+  const db = getDB(env);
+  const ext = await db.prepare(
+    `UPDATE filings SET status='pending_extraction'
+      WHERE status='extraction_failed' AND extract_attempts < ?`
+  ).bind(MAX_EXTRACT_LIFETIME_ATTEMPTS).run();
+  const tri = await db.prepare(
+    `UPDATE filings SET status='pending_triage'
+      WHERE status='triage_failed' AND triage_attempts < ?`
+  ).bind(MAX_TRIAGE_LIFETIME_ATTEMPTS).run();
+  const n = (ext.meta?.changes ?? 0) + (tri.meta?.changes ?? 0);
+  if (n) console.log(`Requeue: ${ext.meta?.changes ?? 0} extraction_failed, ${tri.meta?.changes ?? 0} triage_failed -> pending.`);
+  return n;
+}
+
 async function processTriageQueue(env) {
   const { results: pending } = await getDB(env).prepare(
-    `SELECT id, pdf_url, title, pubdate, triage_attempts FROM filings
+    `SELECT id, pdf_url, title, pubdate, triage_attempts, last_error FROM filings
       WHERE status='pending_triage' ${PRIORITY_ORDER} LIMIT ?`
   ).bind(TRIAGE_BATCH).all();
 
   console.log(`Triage: ${pending.length} pending.`);
   for (const row of pending) {
     try {
-      const { data: r } = await classifyFiling(row.pdf_url, row.title, env, row.pubdate);
+      const { data: r } = await classifyFiling(row.pdf_url, row.title, env, row.pubdate, row.triage_attempts, row.last_error);
       const st = r.is_hotel ? "pending_extraction" : "rejected_not_hotel";
       await getDB(env).prepare(
         `UPDATE filings SET status=?, triage_is_hotel=?, triage_confidence=?,
@@ -197,14 +243,14 @@ async function processTriageQueue(env) {
 
 async function processExtractionQueue(env) {
   const { results: pending } = await getDB(env).prepare(
-    `SELECT id, pdf_url, title, reit_name, pubdate, extract_attempts FROM filings
+    `SELECT id, pdf_url, title, reit_name, pubdate, extract_attempts, last_error FROM filings
       WHERE status='pending_extraction' ${PRIORITY_ORDER} LIMIT ?`
   ).bind(EXTRACT_BATCH).all();
 
   console.log(`Extraction: ${pending.length} pending.`);
   for (const row of pending) {
     try {
-      const { data, pdfAvailable, base64 } = await extractFiling(row.pdf_url, row.title, env, row.pubdate);
+      const { data, pdfAvailable, base64 } = await extractFiling(row.pdf_url, row.title, env, row.pubdate, row.extract_attempts, row.last_error);
 
       let archiveUrl = null;
       if (base64 && driveConfigured(env)) {
@@ -254,7 +300,19 @@ async function processExtractionQueue(env) {
 // ============================================================================
 // GEMINI CALLS
 // ============================================================================
-async function classifyFiling(pdfUrl, title, env, pubdate) {
+// Decides which model/byte-cap to use for THIS attempt, based on what the
+// last attempt's error was. Only "too large" escalates — timeouts/5xx/etc.
+// already retry on the same model via isTransient(), and switching models
+// wouldn't help those anyway.
+function pickGeminiOpts(lastError, attempts) {
+  const tooLarge = /too large/i.test(lastError || "");
+  if (tooLarge && (attempts || 0) >= TOO_LARGE_ESCALATE_AFTER) {
+    return { model: MODEL_FALLBACK, maxPdfBytes: MAX_PDF_BYTES_ESCALATED };
+  }
+  return { model: MODEL, maxPdfBytes: MAX_PDF_BYTES };
+}
+
+async function classifyFiling(pdfUrl, title, env, pubdate, attempts, lastError) {
   const prompt =
     "This is a Japanese J-REIT disclosure filing (TDnet). Decide whether the ASSET " +
     "BEING ACQUIRED OR DISPOSED is itself a HOTEL / resort / lodging property.\n" +
@@ -276,10 +334,10 @@ async function classifyFiling(pdfUrl, title, env, pubdate) {
     },
     required: ["is_hotel", "confidence", "reasoning"],
   };
-  return callGemini(prompt, pdfUrl, schema, env, pubdate);
+  return callGemini(prompt, pdfUrl, schema, env, pubdate, pickGeminiOpts(lastError, attempts));
 }
 
-async function extractFiling(pdfUrl, title, env, pubdate) {
+async function extractFiling(pdfUrl, title, env, pubdate, attempts, lastError) {
   const prompt =
     "This is a Japanese J-REIT hotel transaction disclosure (TDnet). Extract the deal " +
     "for the HOTEL asset being acquired/disposed. Follow these rules carefully:\n" +
@@ -329,7 +387,7 @@ async function extractFiling(pdfUrl, title, env, pubdate) {
     },
     required: ["property_name", "transaction_type"],
   };
-  return callGemini(prompt, pdfUrl, schema, env, pubdate);
+  return callGemini(prompt, pdfUrl, schema, env, pubdate, pickGeminiOpts(lastError, attempts));
 }
 
 // Tags an error with WHICH stage produced it, so last_error reads e.g.
@@ -351,12 +409,15 @@ function withPdfNote(err, pdfNote) {
   return err;
 }
 
-async function callGemini(promptText, pdfUrl, schema, env, pubdate) {
+async function callGemini(promptText, pdfUrl, schema, env, pubdate, opts = {}) {
   const keys = getKeys(env);
   if (keys.length === 0) throw new Error("No Gemini API key configured.");
+  const model = opts.model || MODEL;
+  const maxPdfBytes = opts.maxPdfBytes || MAX_PDF_BYTES;
+  if (model !== MODEL) console.log(`  [escalated] using ${model}, maxPdfBytes=${(maxPdfBytes / 1048576).toFixed(0)}MB`);
 
   let pdfNote = null;
-  const fetched = await fetchPdfAsBase64(pdfUrl, pubdate).catch((e) => { pdfNote = e.message; console.warn(e.message); return null; });
+  const fetched = await fetchPdfAsBase64(pdfUrl, pubdate, maxPdfBytes).catch((e) => { pdfNote = e.message; console.warn(e.message); return null; });
   const base64 = fetched?.base64 || null;
 
   const parts = [{ text: promptText }];
@@ -372,7 +433,7 @@ async function callGemini(promptText, pdfUrl, schema, env, pubdate) {
   const maxAttempts = Math.max(4, keys.length);
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const apiKey = keys[attempt % keys.length];
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
     try {
       res = await fetch(url, {
         method: "POST",
@@ -409,7 +470,7 @@ async function callGemini(promptText, pdfUrl, schema, env, pubdate) {
 }
 
 // ============================================================================
-async function fetchPdfAsBase64(pdfUrl, pubdate) {
+async function fetchPdfAsBase64(pdfUrl, pubdate, maxBytes = MAX_PDF_BYTES) {
   let res;
   try {
     res = await fetch(pdfUrl, { redirect: "follow", signal: AbortSignal.timeout(PDF_TIMEOUT_MS) });
@@ -426,20 +487,18 @@ async function fetchPdfAsBase64(pdfUrl, pubdate) {
     } catch (e) { throw stageError("PDF fetch", e, PDF_TIMEOUT_MS); }
     if (!p.ok || !(p.headers.get("content-type") || "").toLowerCase().includes("pdf"))
       throw new Error("[PDF fetch] linked PDF unavailable");
-    return { base64: await toBase64(p), sourceUrl: m[0] };
+    return { base64: await toBase64(p, maxBytes), sourceUrl: m[0] };
   }
-  return { base64: await toBase64(res), sourceUrl: pdfUrl };
+  return { base64: await toBase64(res, maxBytes), sourceUrl: pdfUrl };
 }
 
-const MAX_PDF_BYTES = 8 * 1024 * 1024; // 8MB — bigger base64 loops risk the CPU-limit kill
-
-async function toBase64(res) {
+async function toBase64(res, maxBytes = MAX_PDF_BYTES) {
   const buf = new Uint8Array(await res.arrayBuffer());
   // Reject oversized PDFs BEFORE the CPU-heavy loop, so a huge file fails fast
   // (catchable -> recorded in last_error, and title-only fallback still works)
   // instead of blowing the isolate's CPU budget and dying with no error.
-  if (buf.length > MAX_PDF_BYTES) {
-    throw new Error(`[PDF fetch] too large: ${(buf.length / 1048576).toFixed(1)}MB > ${MAX_PDF_BYTES / 1048576}MB`);
+  if (buf.length > maxBytes) {
+    throw new Error(`[PDF fetch] too large: ${(buf.length / 1048576).toFixed(1)}MB > ${maxBytes / 1048576}MB`);
   }
   let binary = "", chunk = 0x8000;
   for (let i = 0; i < buf.length; i += chunk) binary += String.fromCharCode.apply(null, buf.subarray(i, i + chunk));
