@@ -332,11 +332,31 @@ async function extractFiling(pdfUrl, title, env, pubdate) {
   return callGemini(prompt, pdfUrl, schema, env, pubdate);
 }
 
+// Tags an error with WHICH stage produced it, so last_error reads e.g.
+// "[Gemini call] timeout after 45s" instead of a bare "aborted due to
+// timeout" that could just as easily have come from the PDF fetch.
+// Keeps the word "timeout" in the message so isTransient() still matches it.
+function stageError(stage, e, timeoutMs) {
+  const isAbort = e?.name === "AbortError" || e?.name === "TimeoutError" ||
+    /abort|timeout/i.test(String(e?.message ?? e));
+  const detail = isAbort ? `timeout after ${(timeoutMs / 1000).toFixed(0)}s` : String(e?.message ?? e);
+  return new Error(`[${stage}] ${detail}`);
+}
+
+// If the PDF fetch already failed before we got to Gemini, fold that context
+// into the final thrown error so a Gemini-stage failure doesn't hide the
+// fact that the PDF stage failed first (both can be visible in last_error).
+function withPdfNote(err, pdfNote) {
+  if (pdfNote) err.message = `${err.message} (also: ${pdfNote})`;
+  return err;
+}
+
 async function callGemini(promptText, pdfUrl, schema, env, pubdate) {
   const keys = getKeys(env);
   if (keys.length === 0) throw new Error("No Gemini API key configured.");
 
-  const fetched = await fetchPdfAsBase64(pdfUrl, pubdate).catch((e) => { console.warn(`PDF: ${e.message}`); return null; });
+  let pdfNote = null;
+  const fetched = await fetchPdfAsBase64(pdfUrl, pubdate).catch((e) => { pdfNote = e.message; console.warn(e.message); return null; });
   const base64 = fetched?.base64 || null;
 
   const parts = [{ text: promptText }];
@@ -353,37 +373,59 @@ async function callGemini(promptText, pdfUrl, schema, env, pubdate) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const apiKey = keys[attempt % keys.length];
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
-    res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
-    });
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
+      });
+    } catch (e) {
+      // Network-level failure (incl. timeout) never used to be retried here —
+      // only non-ok HTTP responses were. Now it gets the same backoff-and-
+      // try-next-key treatment as a 503 before finally giving up.
+      if (attempt === maxAttempts - 1) throw withPdfNote(stageError("Gemini call", e, GEMINI_TIMEOUT_MS), pdfNote);
+      await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, Math.min(attempt, 3))));
+      continue;
+    }
     if (res.ok) break;
     errorText = await res.text();
     const retryable = [429, 500, 503].includes(res.status);
-    if (!retryable || attempt === maxAttempts - 1) throw { status: res.status, message: `Gemini ${res.status}: ${errorText}` };
+    if (!retryable || attempt === maxAttempts - 1)
+      throw withPdfNote({ status: res.status, message: `[Gemini call] HTTP ${res.status}: ${errorText}` }, pdfNote);
     await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, Math.min(attempt, 3))));
   }
 
   const json = await res.json();
   const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error("No text in Gemini response.");
-  return { data: JSON.parse(text), pdfAvailable: !!base64, base64, sourceUrl: fetched?.sourceUrl || null };
+  if (!text) throw withPdfNote(new Error("[Gemini response] no text returned"), pdfNote);
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw withPdfNote(new Error(`[Gemini response] invalid JSON: ${e.message}`), pdfNote);
+  }
+  return { data, pdfAvailable: !!base64, base64, sourceUrl: fetched?.sourceUrl || null };
 }
 
 // ============================================================================
 async function fetchPdfAsBase64(pdfUrl, pubdate) {
-  const res = await fetch(pdfUrl, { redirect: "follow", signal: AbortSignal.timeout(PDF_TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`PDF fetch failed: HTTP ${res.status}`);
+  let res;
+  try {
+    res = await fetch(pdfUrl, { redirect: "follow", signal: AbortSignal.timeout(PDF_TIMEOUT_MS) });
+  } catch (e) { throw stageError("PDF fetch", e, PDF_TIMEOUT_MS); }
+  if (!res.ok) throw new Error(`[PDF fetch] HTTP ${res.status}`);
   const ct = (res.headers.get("content-type") || "").toLowerCase();
   if (!ct.includes("application/pdf")) {
     const html = await res.text();
     const m = html.match(/https?:\/\/[^"'\s)]+\.pdf/i);
-    if (!m) throw new Error("No PDF at URL (source expired)");
-    const p = await fetch(m[0], { redirect: "follow", signal: AbortSignal.timeout(PDF_TIMEOUT_MS) });
+    if (!m) throw new Error("[PDF fetch] no PDF at URL (source expired)");
+    let p;
+    try {
+      p = await fetch(m[0], { redirect: "follow", signal: AbortSignal.timeout(PDF_TIMEOUT_MS) });
+    } catch (e) { throw stageError("PDF fetch", e, PDF_TIMEOUT_MS); }
     if (!p.ok || !(p.headers.get("content-type") || "").toLowerCase().includes("pdf"))
-      throw new Error("Linked PDF unavailable");
+      throw new Error("[PDF fetch] linked PDF unavailable");
     return { base64: await toBase64(p), sourceUrl: m[0] };
   }
   return { base64: await toBase64(res), sourceUrl: pdfUrl };
@@ -397,7 +439,7 @@ async function toBase64(res) {
   // (catchable -> recorded in last_error, and title-only fallback still works)
   // instead of blowing the isolate's CPU budget and dying with no error.
   if (buf.length > MAX_PDF_BYTES) {
-    throw new Error(`PDF too large: ${(buf.length / 1048576).toFixed(1)}MB > ${MAX_PDF_BYTES / 1048576}MB`);
+    throw new Error(`[PDF fetch] too large: ${(buf.length / 1048576).toFixed(1)}MB > ${MAX_PDF_BYTES / 1048576}MB`);
   }
   let binary = "", chunk = 0x8000;
   for (let i = 0; i < buf.length; i += chunk) binary += String.fromCharCode.apply(null, buf.subarray(i, i + chunk));
