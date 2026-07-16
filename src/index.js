@@ -69,6 +69,13 @@ export default {
 
     if (url.pathname === "/discover") { const n = await discoverNewFilings(env); return new Response(`Discovery: inserted ${n}.\n`); }
     if (url.pathname === "/stats")    return statsResponse(env);
+    if (url.pathname === "/errors") { const { results } = await getDB(env).prepare(
+        `SELECT id, reit_name, title, status, extract_attempts, last_error FROM filings
+          WHERE status IN ('extraction_failed','triage_failed') ORDER BY id DESC LIMIT 20`
+      ).all().catch(() => ({ results: [] }));
+      return Response.json(results);
+    }
+
 
     const { results } = await getDB(env).prepare(
       `SELECT * FROM hotel_transactions ORDER BY pubdate DESC`
@@ -160,8 +167,10 @@ async function processTriageQueue(env) {
       // QUOTA: global daily/RPM limit -> stop the batch, leave this item pending.
       if (isQuota(err)) { console.warn(`[quota] triage halted at #${row.id}; resume next run.`); break; }
       // TRANSIENT / poison: count the attempt; retry later unless we've hit the cap.
-      const attempts = (row.triage_attempts || 0) + 1;
-      await getDB(env).prepare(`UPDATE filings SET triage_attempts=? WHERE id=?`).bind(attempts, row.id).run();
+      const attempts = (row.extract_attempts || 0) + 1;
+      const msg = String(err && err.message || err).slice(0, 500);
+      await getDB(env).prepare(`UPDATE filings SET extract_attempts=?, last_error=? WHERE id=?`).bind(attempts, msg, row.id).run();
+
       if (isTransient(err) && attempts < MAX_TRIAGE_ATTEMPTS) {
         console.warn(`[retry-later] triage #${row.id} attempt ${attempts}: ${err.message}`);
         continue; // don't kill the batch — move on to the next filing
