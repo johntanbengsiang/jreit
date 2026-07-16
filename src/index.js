@@ -42,7 +42,11 @@ const MAX_TRIAGE_ATTEMPTS = 4;
 const MAX_EXTRACT_LIFETIME_ATTEMPTS = 10;
 const MAX_TRIAGE_LIFETIME_ATTEMPTS = 10;
 const PDF_TIMEOUT_MS = 20000;
-const GEMINI_TIMEOUT_MS = 45000;
+const GEMINI_TIMEOUT_MS = 45000;         // triage — small 3-field schema, should be fast
+const GEMINI_TIMEOUT_MS_EXTRACT = 60000; // extraction — heavier 14-field schema, give it more room.
+                                          // Wall-clock wait doesn't cost Workers CPU time, so
+                                          // this is basically free; it only affects how long a
+                                          // manual /extract hit or a cron tick takes to finish.
 
 // Both Flash and Flash-Lite share the same 1M-token context — switching
 // models does NOT by itself let a bigger PDF through. This cap is a Workers
@@ -304,12 +308,12 @@ async function processExtractionQueue(env) {
 // last attempt's error was. Only "too large" escalates — timeouts/5xx/etc.
 // already retry on the same model via isTransient(), and switching models
 // wouldn't help those anyway.
-function pickGeminiOpts(lastError, attempts) {
+function pickGeminiOpts(lastError, attempts, geminiTimeoutMs) {
   const tooLarge = /too large/i.test(lastError || "");
-  if (tooLarge && (attempts || 0) >= TOO_LARGE_ESCALATE_AFTER) {
-    return { model: MODEL_FALLBACK, maxPdfBytes: MAX_PDF_BYTES_ESCALATED };
-  }
-  return { model: MODEL, maxPdfBytes: MAX_PDF_BYTES };
+  const base = (tooLarge && (attempts || 0) >= TOO_LARGE_ESCALATE_AFTER)
+    ? { model: MODEL_FALLBACK, maxPdfBytes: MAX_PDF_BYTES_ESCALATED }
+    : { model: MODEL, maxPdfBytes: MAX_PDF_BYTES };
+  return { ...base, geminiTimeoutMs };
 }
 
 async function classifyFiling(pdfUrl, title, env, pubdate, attempts, lastError) {
@@ -387,7 +391,7 @@ async function extractFiling(pdfUrl, title, env, pubdate, attempts, lastError) {
     },
     required: ["property_name", "transaction_type"],
   };
-  return callGemini(prompt, pdfUrl, schema, env, pubdate, pickGeminiOpts(lastError, attempts));
+  return callGemini(prompt, pdfUrl, schema, env, pubdate, pickGeminiOpts(lastError, attempts, GEMINI_TIMEOUT_MS_EXTRACT));
 }
 
 // Tags an error with WHICH stage produced it, so last_error reads e.g.
@@ -414,6 +418,7 @@ async function callGemini(promptText, pdfUrl, schema, env, pubdate, opts = {}) {
   if (keys.length === 0) throw new Error("No Gemini API key configured.");
   const model = opts.model || MODEL;
   const maxPdfBytes = opts.maxPdfBytes || MAX_PDF_BYTES;
+  const geminiTimeoutMs = opts.geminiTimeoutMs || GEMINI_TIMEOUT_MS;
   if (model !== MODEL) console.log(`  [escalated] using ${model}, maxPdfBytes=${(maxPdfBytes / 1048576).toFixed(0)}MB`);
 
   let pdfNote = null;
@@ -439,14 +444,20 @@ async function callGemini(promptText, pdfUrl, schema, env, pubdate, opts = {}) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
+        signal: AbortSignal.timeout(geminiTimeoutMs),
       });
     } catch (e) {
-      // Network-level failure (incl. timeout) never used to be retried here —
-      // only non-ok HTTP responses were. Now it gets the same backoff-and-
-      // try-next-key treatment as a 503 before finally giving up.
-      if (attempt === maxAttempts - 1) throw withPdfNote(stageError("Gemini call", e, GEMINI_TIMEOUT_MS), pdfNote);
-      await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, Math.min(attempt, 3))));
+      // A network-level failure (incl. timeout) here means the request never
+      // got a response at all. Earlier this looped through every key on a
+      // timeout too, same as a 503 — but with multiple keys configured, that
+      // meant ONE stuck filing burned a wasted, timed-out request against
+      // EVERY key's quota. If it's genuinely one flaky key, a single retry on
+      // the next key still catches that. If it's not (all keys affected at
+      // once — account throttling, or Gemini/network having a bad moment),
+      // more attempts right now won't help; the next cron tick (2 min later)
+      // or the requeue sweep (15 min later) gives real recovery time instead.
+      if (attempt >= 1 || attempt === maxAttempts - 1) throw withPdfNote(stageError("Gemini call", e, geminiTimeoutMs), pdfNote);
+      await new Promise((r) => setTimeout(r, 1000));
       continue;
     }
     if (res.ok) break;
