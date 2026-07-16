@@ -14,7 +14,7 @@
   // summary lines; enabled:false turns OFF persisted/queryable logs.
   "observability": {
     "logs": {
-      "enabled": false,
+      "enabled": true,
       "invocation_logs": true
     }
   },
