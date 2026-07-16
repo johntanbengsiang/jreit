@@ -55,6 +55,11 @@ const GEMINI_TIMEOUT_MS_EXTRACT = 60000; // extraction — heavier 14-field sche
 const MAX_PDF_BYTES = 8 * 1024 * 1024;            // normal cap
 const MAX_PDF_BYTES_ESCALATED = 16 * 1024 * 1024; // used once escalated — raises CPU-limit-kill risk, watch it
 const TOO_LARGE_ESCALATE_AFTER = 1; // escalate once a "too large" error has happened this many times
+// Safety net: if a filing keeps timing out against flash-lite for ANY reason
+// (not just "too large" — e.g. flash-lite having a slow/degraded patch),
+// give it a few tries first, then let a completely different model pool have
+// a shot instead of retrying the same lane forever.
+const GEMINI_TIMEOUT_ESCALATE_AFTER = 3;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -310,7 +315,11 @@ async function processExtractionQueue(env) {
 // wouldn't help those anyway.
 function pickGeminiOpts(lastError, attempts, geminiTimeoutMs) {
   const tooLarge = /too large/i.test(lastError || "");
-  const base = (tooLarge && (attempts || 0) >= TOO_LARGE_ESCALATE_AFTER)
+  const repeatedTimeout = /\[Gemini call\][^(]*timeout/i.test(lastError || "");
+  const escalate =
+    (tooLarge && (attempts || 0) >= TOO_LARGE_ESCALATE_AFTER) ||
+    (repeatedTimeout && (attempts || 0) >= GEMINI_TIMEOUT_ESCALATE_AFTER);
+  const base = escalate
     ? { model: MODEL_FALLBACK, maxPdfBytes: MAX_PDF_BYTES_ESCALATED }
     : { model: MODEL, maxPdfBytes: MAX_PDF_BYTES };
   return { ...base, geminiTimeoutMs };
@@ -391,7 +400,26 @@ async function extractFiling(pdfUrl, title, env, pubdate, attempts, lastError) {
     },
     required: ["property_name", "transaction_type"],
   };
-  return callGemini(prompt, pdfUrl, schema, env, pubdate, pickGeminiOpts(lastError, attempts, GEMINI_TIMEOUT_MS_EXTRACT));
+
+  // When there's no PDF, the prompt already tells the model to leave numeric/
+  // geo/date fields empty — so don't also force it to reason over all 16
+  // fields of the full schema. A much lighter ask, matching the size of
+  // triage's schema (which never has this problem).
+  const titleOnlySchema = {
+    type: "object",
+    properties: {
+      property_name:    { type: "string" },
+      property_name_en: { type: "string" },
+      transaction_type: { type: "string", enum: ["acquisition", "disposal"] },
+      multi_property:   { type: "boolean" },
+      needs_review:     { type: "boolean" },
+      review_note:      { type: "string" },
+    },
+    required: ["property_name", "transaction_type"],
+  };
+
+  const opts = { ...pickGeminiOpts(lastError, attempts, GEMINI_TIMEOUT_MS_EXTRACT), titleOnlySchema };
+  return callGemini(prompt, pdfUrl, schema, env, pubdate, opts);
 }
 
 // Tags an error with WHICH stage produced it, so last_error reads e.g.
@@ -429,9 +457,11 @@ async function callGemini(promptText, pdfUrl, schema, env, pubdate, opts = {}) {
   if (base64) parts.push({ inlineData: { mimeType: "application/pdf", data: base64 } });
   else parts[0].text += "\n\n(NOTE: PDF unavailable — judge from title; leave numeric fields empty and set needs_review true.)";
 
+  const effectiveSchema = (!base64 && opts.titleOnlySchema) ? opts.titleOnlySchema : schema;
+
   const payload = {
     contents: [{ parts }],
-    generationConfig: { responseMimeType: "application/json", responseSchema: schema, temperature: 0 },
+    generationConfig: { responseMimeType: "application/json", responseSchema: effectiveSchema, temperature: 0 },
   };
 
   let res, errorText;
