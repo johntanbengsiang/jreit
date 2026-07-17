@@ -97,10 +97,12 @@ export default {
   async scheduled(event, env, ctx) {
     await ensureTable(env);
     await ensureColumns(env);
-    const min = new Date().getMinutes();
+    const now = new Date(), min = now.getMinutes();
     if (min % 15 === 0)      ctx.waitUntil(requeueFailedJobs(env).then(() => discoverNewFilings(env)));
     else if (min % 2 === 0)  ctx.waitUntil(processExtractionQueue(env));
     else                     ctx.waitUntil(processTriageQueue(env));
+    // Once a day (~21:00 UTC): rotating best-effort refresh of REIT LTV/AUM.
+    if (now.getUTCHours() === 21 && min < 5) ctx.waitUntil(refreshReitMaster(env));
   },
 
   async fetch(request, env, ctx) {
@@ -130,6 +132,14 @@ export default {
       return Response.json(results);
     }
 
+    if (url.pathname === "/reits" || url.pathname === "/reits.json" || url.pathname === "/reits.csv") {
+      const reits = await getReitMaster(env);
+      if (url.pathname === "/reits.json") return Response.json(reits);
+      if (url.pathname === "/reits.csv")  return reitsCsv(reits);
+      return reitsHtmlResponse(reits);
+    }
+    if (url.pathname === "/reits-refresh") { const n = await refreshReitMaster(env); return new Response(`REIT refresh: updated ${n}.\n`); }
+
     const { results } = await getDB(env).prepare(
       `SELECT * FROM hotel_transactions ORDER BY pubdate DESC`
     ).all().catch(() => ({ results: [] }));
@@ -152,6 +162,14 @@ async function ensureTable(env) {
        appraisal_jpy INTEGER, closing_date TEXT,
        multi_property INTEGER, needs_review INTEGER, review_note TEXT,
        pubdate TEXT, source TEXT, archive_url TEXT, extracted_at TEXT DEFAULT (datetime('now'))
+     )`
+  ).run();
+  await getDB(env).prepare(
+    `CREATE TABLE IF NOT EXISTS reit_master (
+       code TEXT PRIMARY KEY, name_en TEXT, name_jp TEXT,
+       category TEXT, primary_sector TEXT, is_pure_hospitality INTEGER,
+       ltv_pct REAL, total_aum_bn REAL, hospitality_aum_bn REAL, hospitality_pct REAL,
+       as_of TEXT, source_url TEXT, note TEXT, refreshed_at TEXT DEFAULT (datetime('now'))
      )`
   ).run();
 }
@@ -642,6 +660,215 @@ function isTransient(err) {
 }
 
 // ============================================================================
+// ============================================================================
+// REIT OVERVIEW TAB (LTV, category, hospitality AUM)
+// ============================================================================
+// Maps hotel_transactions.reit_name -> TSE code so the tab can show how many
+// deals this tracker holds per REIT (a live cross-check from our own data).
+const NAME_TO_CODE = {
+  "Japan Hotel REIT":"8985","Invincible Investment":"8963","Hoshino Resorts REIT":"3287",
+  "Ichigo Hotel REIT":"3463","Nippon Hotel & Residential (ex-Ooedo)":"3472","Star Asia":"3468",
+  "United Urban":"8960","Nomura Real Estate Master Fund":"3462","ORIX JREIT":"8954",
+  "Daiwa House REIT":"8984","KDX Realty":"8972","One REIT":"3290","Nippon REIT":"3296",
+  "Escon Japan REIT":"2971","Takara Leben RE (MIRARTH)":"3492","Japan Prime Realty":"8955",
+  "Hulic REIT":"3295","Japan Metropolitan Fund":"8953",
+};
+
+async function getReitMaster(env) {
+  const db = getDB(env);
+  const { results: master } = await db.prepare(`SELECT * FROM reit_master`).all().catch(() => ({ results: [] }));
+  const { results: deals } = await db.prepare(
+    `SELECT reit_name, COUNT(*) AS n,
+       SUM(CASE WHEN transaction_type='acquisition' THEN 1 ELSE 0 END) AS acq,
+       SUM(CASE WHEN transaction_type='disposal'    THEN 1 ELSE 0 END) AS disp
+     FROM hotel_transactions GROUP BY reit_name`
+  ).all().catch(() => ({ results: [] }));
+  const byCode = {};
+  for (const d of deals) {
+    const c = NAME_TO_CODE[d.reit_name]; if (!c) continue;
+    byCode[c] = byCode[c] || { n: 0, acq: 0, disp: 0 };
+    byCode[c].n += d.n; byCode[c].acq += d.acq; byCode[c].disp += d.disp;
+  }
+  for (const m of master) {
+    const d = byCode[m.code] || { n: 0, acq: 0, disp: 0 };
+    m.tracked_deals = d.n; m.tracked_acq = d.acq; m.tracked_disp = d.disp;
+  }
+  master.sort((a, b) => (b.hospitality_aum_bn || -1) - (a.hospitality_aum_bn || -1) || String(a.code).localeCompare(String(b.code)));
+  return master;
+}
+
+// Daily, rotating, best-effort refresh. LTV/AUM only change at earnings (~2×/yr),
+// so this mostly no-ops between disclosures — it re-checks a few REITs per run,
+// updates only on a confident parse within sanity bounds (never nulls seed data),
+// and always stamps refreshed_at. Tiny subrequest cost: ~4 fetches/day.
+async function refreshReitMaster(env) {
+  const db = getDB(env);
+  const { results } = await db.prepare(
+    "SELECT code FROM reit_master WHERE COALESCE(note,'') NOT LIKE '%delist%' ORDER BY refreshed_at ASC LIMIT 4"
+  ).all().catch(() => ({ results: [] }));
+  let updated = 0;
+  for (const r of results) {
+    const code = r.code;
+    try {
+      const res = await fetchWithUA(`https://www.japan-reit.com/meigara/${code}/`).catch(() => null);
+      let ltv = null, aum = null;
+      if (res && res.ok) {
+        const html = await res.text();
+        const l = html.match(/総資産LTV[\s\S]{0,30}?(\d{2}(?:\.\d)?)\s*[%％]/);
+        if (l) { const v = parseFloat(l[1]); if (v >= 10 && v <= 80) ltv = v; }
+        const a = html.match(/資産規模[\s\S]{0,40}?([\d,]+)\s*億円/);
+        if (a) { const v = parseFloat(a[1].replace(/,/g, "")) / 10; if (v >= 5 && v <= 5000) aum = +v.toFixed(1); }
+      }
+      const sets = [], binds = [];
+      if (ltv != null) { sets.push("ltv_pct=?"); binds.push(ltv); }
+      if (aum != null) { sets.push("total_aum_bn=?"); binds.push(aum); }
+      sets.push("refreshed_at=datetime('now')"); binds.push(code);
+      await db.prepare(`UPDATE reit_master SET ${sets.join(",")} WHERE code=?`).bind(...binds).run();
+      if (sets.length > 1) updated++;
+      await sleep(DELAY_MS);
+    } catch (e) {
+      console.warn(`reit refresh ${code}: ${e.message}`);
+      await db.prepare("UPDATE reit_master SET refreshed_at=datetime('now') WHERE code=?").bind(code).run().catch(() => {});
+    }
+  }
+  console.log(`reit_master refresh: checked ${results.length}, updated ${updated}`);
+  return updated;
+}
+
+function reitsCsv(rows) {
+  const cols = ["code","name_en","name_jp","category","primary_sector","ltv_pct","total_aum_bn",
+    "hospitality_aum_bn","hospitality_pct","tracked_deals","tracked_acq","tracked_disp","as_of","note","source_url"];
+  const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const lines = [cols.join(",")];
+  for (const r of rows) lines.push(cols.map((c) => esc(r[c])).join(","));
+  return new Response(lines.join("\n"), {
+    headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": 'attachment; filename="reit_master.csv"' },
+  });
+}
+
+function reitsHtmlResponse(rows) {
+  const json = JSON.stringify(rows).replace(/</g, "\\u003c");
+  const html = `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>J-REIT Overview — LTV & Hospitality AUM</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:1rem;color:#111}
+ h1{font-size:1.2rem;margin:0 0 .3rem}
+ a.tab{display:inline-block;margin:0 6px .6rem 0;padding:5px 10px;background:#eef;border-radius:4px;text-decoration:none;color:#2563eb}
+ .kpis{display:flex;flex-wrap:wrap;gap:12px;margin:.4rem 0 1rem}
+ .kpi{border:1px solid #e5e7eb;border-radius:8px;padding:8px 12px;min-width:110px}
+ .kpi b{display:block;font-size:1.2rem}.kpi span{font-size:12px;color:#666}
+ .controls{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:.6rem;font-size:13px;align-items:center}
+ select,input{padding:4px 6px;font-size:13px}
+ table{border-collapse:collapse;width:100%;font-size:12px}
+ th,td{border:1px solid #ddd;padding:5px 7px;white-space:nowrap;vertical-align:top}
+ th{background:#f4f4f4;text-align:left;cursor:pointer}
+ td.n{text-align:right}td.name{white-space:normal;min-width:190px}
+ .pill{padding:1px 7px;border-radius:10px;font-size:11px}
+ .p-pure{background:#dcfce7;color:#166534}.p-div{background:#dbeafe;color:#1e40af}.p-other{background:#f3f4f6;color:#374151}
+ .bar{height:9px;background:#2563eb;border-radius:3px;display:inline-block;vertical-align:middle;margin-left:6px}
+ .muted{color:#666;font-size:12px}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head><body>
+<a class="tab" href="/">← Transactions &amp; map</a><a class="tab" href="/reits">REIT overview</a>
+<h1>J-REIT Overview — LTV, Category &amp; Hospitality AUM <span id="cnt" class="muted"></span></h1>
+<div class="kpis" id="kpis"></div>
+<div style="border:1px solid #eee;border-radius:6px;padding:8px;margin:.2rem 0 1rem"><h3 style="margin:.1rem 0 .4rem;font-size:13px;color:#333">Hotel-holder LTV (%) — bar per REIT · median &amp; hotel-AUM-weighted average</h3><div style="height:300px"><canvas id="ltvchart"></canvas></div></div>
+<div class="controls">
+  <label>Category <select id="fCat"><option value="">All</option>
+    <option>Pure-play hospitality</option><option>Diversified — holds hotels</option></select></label>
+  <label><input type="checkbox" id="fHotel"> Hotel-holders only</label>
+  <label>Search <input id="fText" placeholder="REIT / code…"></label>
+  <a class="tab" href="/reits.csv">Download CSV</a>
+</div>
+<div style="overflow-x:auto"><table id="t"><thead><tr>
+ <th data-k="code">Code</th><th data-k="name_en">REIT</th><th data-k="category">Category</th>
+ <th data-k="primary_sector">Sector</th><th data-k="ltv_pct">LTV %</th>
+ <th data-k="total_aum_bn">REIT AUM ¥bn</th><th data-k="hospitality_aum_bn">Hotel-only AUM ¥bn</th>
+ <th data-k="hospitality_pct">Hosp %</th><th data-k="tracked_deals">Tracked deals</th>
+ <th data-k="as_of">As-of</th><th data-k="note">Note</th>
+</tr></thead><tbody id="tb"></tbody></table></div>
+<p class="muted">LTV &amp; AUM are each REIT's latest disclosed figures (semi-annual); "As-of" is the disclosure period. <b>REIT AUM</b> = whole portfolio; <b>Hotel-only AUM</b> = hotel/lodging portion (acquisition-price basis). LTV bar colour: green &lt;40%, lime &lt;45%, amber &lt;50%, red ≥50%. Per-REIT <b>hotel-only LTV is not separately disclosed</b> (REITs don't publish per-sector debt), so the hotel-vs-REIT leverage comparison is shown at portfolio level via the two weighted-LTV KPIs and the chart's dashed lines (median &amp; hotel-AUM-weighted average). "Tracked deals" = this tracker's 2019–2026 hotel acquisitions/disposals (acq/disp). Figures re-checked daily on rotation.</p>
+<script>
+const D=${json};
+const maxH=Math.max(1,...D.map(r=>r.hospitality_aum_bn||0));
+const fmt=(v,d=0)=>(v==null||v==="")?"":(+v).toLocaleString(undefined,{maximumFractionDigits:d});
+const med=a=>{a=a.filter(v=>v!=null&&!isNaN(v)).sort((x,y)=>x-y);if(!a.length)return null;const m=a.length>>1;return a.length%2?a[m]:(a[m-1]+a[m])/2;};
+function ltvBand(v){return v==null?'#9ca3af':v<40?'#16a34a':v<45?'#84cc16':v<50?'#f59e0b':'#dc2626';}
+function ltvCell(v){if(v==null)return '<span class="muted">—</span>';const w=(Math.max(4,Math.min(60,v))/60*70).toFixed(0);return '<div style="display:flex;align-items:center;gap:6px"><span style="width:'+w+'px;height:10px;border-radius:3px;background:'+ltvBand(v)+'"></span><span>'+(+v).toFixed(1)+'%</span></div>';}
+function ltvChart(){
+  if(typeof Chart==='undefined')return;
+  const hh=D.filter(r=>r.hospitality_aum_bn>0&&r.ltv_pct!=null).sort((a,b)=>b.ltv_pct-a.ltv_pct);
+  if(!hh.length)return;
+  const m=med(hh.map(r=>r.ltv_pct));
+  const ws=hh.reduce((s,r)=>s+r.hospitality_aum_bn,0);
+  const wa=ws?hh.reduce((s,r)=>s+r.ltv_pct*r.hospitality_aum_bn,0)/ws:null;
+  new Chart(document.getElementById('ltvchart'),{type:'bar',
+    data:{labels:hh.map(r=>r.code),datasets:[{data:hh.map(r=>r.ltv_pct),backgroundColor:hh.map(r=>ltvBand(r.ltv_pct))}]},
+    options:{maintainAspectRatio:false,plugins:{legend:{display:false},
+      tooltip:{callbacks:{label:c=>hh[c.dataIndex].name_en+': '+c.raw+'%'}},
+      med:{lines:[{val:m,label:'median '+(m==null?'—':m.toFixed(1)+'%'),color:'#111'},
+                  {val:wa,label:'hotel-AUM wtd avg '+(wa==null?'—':wa.toFixed(1)+'%'),color:'#7c3aed'}]}},
+      scales:{y:{title:{display:true,text:'LTV %'}},x:{ticks:{font:{size:9},maxRotation:90,minRotation:90}}}}});
+}
+function kpis(){
+  const pure=D.filter(r=>r.category==='Pure-play hospitality').length;
+  const div=D.filter(r=>r.category==='Diversified — holds hotels').length;
+  const hh=D.filter(r=>r.hospitality_aum_bn>0);
+  const hAUM=hh.reduce((s,r)=>s+(r.hospitality_aum_bn||0),0);
+  const rAUM=hh.reduce((s,r)=>s+(r.total_aum_bn||0),0);
+  const wl=hh.filter(r=>r.ltv_pct!=null);
+  const mltv=med(wl.map(r=>r.ltv_pct));
+  const wH=wl.reduce((s,r)=>s+r.hospitality_aum_bn,0), wR=wl.reduce((s,r)=>s+r.total_aum_bn,0);
+  const ltvH=wH?wl.reduce((s,r)=>s+r.ltv_pct*r.hospitality_aum_bn,0)/wH:null;
+  const ltvR=wR?wl.reduce((s,r)=>s+r.ltv_pct*r.total_aum_bn,0)/wR:null;
+  document.getElementById('kpis').innerHTML=[
+    ['Hotel-holding REITs',hh.length],['Pure-play',pure],['Diversified w/ hotels',div],
+    ['Σ REIT AUM (holders)','¥'+fmt(rAUM,0)+'bn'],['Σ Hotel-only AUM','¥'+fmt(hAUM,0)+'bn'],
+    ['Median LTV',mltv==null?'—':mltv.toFixed(1)+'%'],
+    ['LTV · REIT-AUM wtd',ltvR==null?'—':ltvR.toFixed(1)+'%'],
+    ['LTV · Hotel-AUM wtd',ltvH==null?'—':ltvH.toFixed(1)+'%']]
+    .map(k=>'<div class="kpi"><b>'+k[1]+'</b><span>'+k[0]+'</span></div>').join('');
+}
+let sortK='hospitality_aum_bn',sortD=-1;
+function pill(c){const cl=c==='Pure-play hospitality'?'p-pure':c==='Diversified — holds hotels'?'p-div':'p-other';return '<span class="pill '+cl+'">'+c+'</span>';}
+function render(){
+  const cat=document.getElementById('fCat').value,hotel=document.getElementById('fHotel').checked;
+  const q=document.getElementById('fText').value.toLowerCase();
+  let rows=D.filter(r=>{
+    if(cat&&r.category!==cat)return false;
+    if(hotel&&!(r.hospitality_aum_bn>0))return false;
+    if(q&&!((r.name_en||'')+' '+(r.name_jp||'')+' '+r.code).toLowerCase().includes(q))return false;
+    return true;});
+  rows.sort((a,b)=>{let x=a[sortK],y=b[sortK];
+    if(typeof x==='string'||typeof y==='string')return sortD*String(x||'').localeCompare(String(y||''));
+    return sortD*(((x==null?-1:x))-((y==null?-1:y)));});
+  document.getElementById('cnt').textContent='('+rows.length+' of '+D.length+')';
+  document.getElementById('tb').innerHTML=rows.map(r=>{
+    const name=r.name_jp?('<b>'+r.name_jp+'</b><br><small style="color:#555">'+(r.name_en||'')+'</small>'):(r.name_en||'');
+    const bw=Math.round((r.hospitality_aum_bn||0)/maxH*80);
+    const bar=r.hospitality_aum_bn>0?'<span class="bar" style="width:'+bw+'px"></span>':'';
+    const src=r.source_url?'<a href="'+r.source_url+'" target="_blank">src</a>':'';
+    const deals=r.tracked_deals?(r.tracked_deals+' <small>('+r.tracked_acq+'/'+r.tracked_disp+')</small>'):'';
+    return '<tr><td>'+r.code+'</td><td class="name">'+name+'</td><td>'+pill(r.category)+'</td>'+
+      '<td>'+(r.primary_sector||'')+'</td><td>'+ltvCell(r.ltv_pct)+'</td>'+
+      '<td class="n">'+fmt(r.total_aum_bn,0)+'</td>'+
+      '<td class="n">'+(r.hospitality_aum_bn?fmt(r.hospitality_aum_bn,0):'0')+bar+'</td>'+
+      '<td class="n">'+(r.hospitality_pct==null?'':r.hospitality_pct+'%')+'</td>'+
+      '<td class="n">'+deals+'</td><td>'+(r.as_of||'')+'</td>'+
+      '<td class="name"><small>'+(r.note||'')+((r.note&&src)?' · ':'')+src+'</small></td></tr>';
+  }).join('');
+}
+document.querySelectorAll('th[data-k]').forEach(th=>th.onclick=()=>{const k=th.dataset.k;
+  if(sortK===k)sortD*=-1;else{sortK=k;sortD=['name_en','code','category','primary_sector','as_of'].includes(k)?1:-1;}render();});
+['fCat','fHotel','fText'].forEach(id=>document.getElementById(id).addEventListener('input',render));
+if(typeof Chart!=='undefined'){Chart.register({id:'med',afterDraw(ch){const o=ch.options.plugins.med;if(!o)return;const{ctx,chartArea:{left,right,top,bottom},scales:{y}}=ch;ctx.save();ctx.font='11px system-ui';ctx.lineWidth=1.5;(o.lines||[]).forEach(L=>{if(L.val==null)return;const py=y.getPixelForValue(L.val);if(py<top||py>bottom)return;ctx.setLineDash([6,4]);ctx.strokeStyle=L.color;ctx.beginPath();ctx.moveTo(left,py);ctx.lineTo(right,py);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=L.color;ctx.fillText(L.label,left+4,py-3);});ctx.restore();}});}
+kpis();render();ltvChart();
+</script></body></html>`;
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
 async function statsResponse(env) {
   const db = getDB(env);
   const safe = async (sql) => (await db.prepare(sql).all().catch(() => ({ results: [] }))).results;
@@ -751,6 +978,7 @@ function htmlResponse(rows) {
   tr.rev{background:#fff7ed}
   .muted{color:#666;font-size:12px}
 </style></head><body>
+<div style="margin-bottom:.5rem"><a href="/reits" style="padding:5px 10px;background:#eef;border-radius:4px;text-decoration:none;color:#2563eb">REIT overview (LTV &amp; hospitality AUM) →</a></div>
 <h1>J-REIT Hotel Transactions <span id="count" class="muted"></span></h1>
 <div class="controls">
   <label>Type<br><select id="fType" multiple size="2">
