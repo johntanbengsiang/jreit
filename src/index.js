@@ -762,7 +762,7 @@ function reitsHtmlResponse(rows) {
  select,input{padding:4px 6px;font-size:13px}
  table{border-collapse:collapse;width:100%;font-size:12px}
  th,td{border:1px solid #ddd;padding:5px 7px;white-space:nowrap;vertical-align:top}
- th{background:#f4f4f4;text-align:left;cursor:pointer}
+ th{background:#f4f4f4;text-align:left;cursor:pointer;position:sticky;top:0;z-index:2}
  td.n{text-align:right}td.name{white-space:normal;min-width:190px}
  .pill{padding:1px 7px;border-radius:10px;font-size:11px}
  .p-pure{background:#dcfce7;color:#166534}.p-div{background:#dbeafe;color:#1e40af}.p-other{background:#f3f4f6;color:#374151}
@@ -776,13 +776,13 @@ function reitsHtmlResponse(rows) {
 <div class="kpis" id="kpis"></div>
 <div style="border:1px solid #eee;border-radius:6px;padding:8px;margin:.2rem 0 1rem"><h3 style="margin:.1rem 0 .4rem;font-size:13px;color:#333">Hotel-holder LTV (%) — bar per REIT · median &amp; hotel-AUM-weighted average</h3><div style="height:300px"><canvas id="ltvchart"></canvas></div></div>
 <div class="controls">
-  <label>Category <select id="fCat"><option value="">All</option>
-    <option>Pure-play hospitality</option><option>Diversified — holds hotels</option></select></label>
+  <label>Category<br><select id="fCat" multiple size="3"></select></label>
+  <label>Sector<br><select id="fSec" multiple size="4"></select></label>
   <label><input type="checkbox" id="fHotel"> Hotel-holders only</label>
-  <label>Search <input id="fText" placeholder="REIT / code…"></label>
+  <label>Search<br><input id="fText" placeholder="REIT / code…"></label>
   <a class="tab" href="/reits.csv">Download CSV</a>
 </div>
-<div style="overflow-x:auto"><table id="t"><thead><tr>
+<div style="overflow:auto;max-height:78vh"><table id="t"><thead><tr>
  <th data-k="code">Code</th><th data-k="name_en">REIT</th><th data-k="category">Category</th>
  <th data-k="primary_sector">Sector</th><th data-k="ltv_pct">LTV %</th>
  <th data-k="total_aum_bn">REIT AUM ¥bn</th><th data-k="hospitality_aum_bn">Hotel-only AUM ¥bn</th>
@@ -793,18 +793,24 @@ function reitsHtmlResponse(rows) {
 <script>
 const D=${json};
 const maxH=Math.max(1,...D.map(r=>r.hospitality_aum_bn||0));
+const sel=s=>[...s.selectedOptions].map(o=>o.value);
+const fCat=document.getElementById('fCat'), fSec=document.getElementById('fSec');
+const fillOpts=(s,vals)=>{s.innerHTML=vals.map(v=>'<option>'+v+'</option>').join('');};
+fillOpts(fCat,[...new Set(D.map(r=>r.category).filter(Boolean))].sort());
+fillOpts(fSec,[...new Set(D.map(r=>r.primary_sector).filter(Boolean))].sort());
 const fmt=(v,d=0)=>(v==null||v==="")?"":(+v).toLocaleString(undefined,{maximumFractionDigits:d});
 const med=a=>{a=a.filter(v=>v!=null&&!isNaN(v)).sort((x,y)=>x-y);if(!a.length)return null;const m=a.length>>1;return a.length%2?a[m]:(a[m-1]+a[m])/2;};
 function ltvBand(v){return v==null?'#9ca3af':v<40?'#16a34a':v<45?'#84cc16':v<50?'#f59e0b':'#dc2626';}
 function ltvCell(v){if(v==null)return '<span class="muted">—</span>';const w=(Math.max(4,Math.min(60,v))/60*70).toFixed(0);return '<div style="display:flex;align-items:center;gap:6px"><span style="width:'+w+'px;height:10px;border-radius:3px;background:'+ltvBand(v)+'"></span><span>'+(+v).toFixed(1)+'%</span></div>';}
-function ltvChart(){
+let ltvC;
+function ltvChart(rows){
   if(typeof Chart==='undefined')return;
-  const hh=D.filter(r=>r.hospitality_aum_bn>0&&r.ltv_pct!=null).sort((a,b)=>b.ltv_pct-a.ltv_pct);
-  if(!hh.length)return;
+  const hh=rows.filter(r=>r.hospitality_aum_bn>0&&r.ltv_pct!=null).sort((a,b)=>b.ltv_pct-a.ltv_pct);
   const m=med(hh.map(r=>r.ltv_pct));
   const ws=hh.reduce((s,r)=>s+r.hospitality_aum_bn,0);
   const wa=ws?hh.reduce((s,r)=>s+r.ltv_pct*r.hospitality_aum_bn,0)/ws:null;
-  new Chart(document.getElementById('ltvchart'),{type:'bar',
+  if(ltvC)ltvC.destroy();
+  ltvC=new Chart(document.getElementById('ltvchart'),{type:'bar',
     data:{labels:hh.map(r=>r.code),datasets:[{data:hh.map(r=>r.ltv_pct),backgroundColor:hh.map(r=>ltvBand(r.ltv_pct))}]},
     options:{maintainAspectRatio:false,plugins:{legend:{display:false},
       tooltip:{callbacks:{label:c=>hh[c.dataIndex].name_en+': '+c.raw+'%'}},
@@ -834,10 +840,11 @@ function kpis(){
 let sortK='hospitality_aum_bn',sortD=-1;
 function pill(c){const cl=c==='Pure-play hospitality'?'p-pure':c==='Diversified — holds hotels'?'p-div':'p-other';return '<span class="pill '+cl+'">'+c+'</span>';}
 function render(){
-  const cat=document.getElementById('fCat').value,hotel=document.getElementById('fHotel').checked;
+  const cats=sel(fCat),secs=sel(fSec),hotel=document.getElementById('fHotel').checked;
   const q=document.getElementById('fText').value.toLowerCase();
   let rows=D.filter(r=>{
-    if(cat&&r.category!==cat)return false;
+    if(cats.length&&!cats.includes(r.category))return false;
+    if(secs.length&&!secs.includes(r.primary_sector))return false;
     if(hotel&&!(r.hospitality_aum_bn>0))return false;
     if(q&&!((r.name_en||'')+' '+(r.name_jp||'')+' '+r.code).toLowerCase().includes(q))return false;
     return true;});
@@ -859,12 +866,14 @@ function render(){
       '<td class="n">'+deals+'</td><td>'+(r.as_of||'')+'</td>'+
       '<td class="name"><small>'+(r.note||'')+((r.note&&src)?' · ':'')+src+'</small></td></tr>';
   }).join('');
+  ltvChart(rows);
 }
 document.querySelectorAll('th[data-k]').forEach(th=>th.onclick=()=>{const k=th.dataset.k;
   if(sortK===k)sortD*=-1;else{sortK=k;sortD=['name_en','code','category','primary_sector','as_of'].includes(k)?1:-1;}render();});
-['fCat','fHotel','fText'].forEach(id=>document.getElementById(id).addEventListener('input',render));
+['fCat','fSec','fHotel'].forEach(id=>document.getElementById(id).addEventListener('change',render));
+document.getElementById('fText').addEventListener('input',render);
 if(typeof Chart!=='undefined'){Chart.register({id:'med',afterDraw(ch){const o=ch.options.plugins.med;if(!o)return;const{ctx,chartArea:{left,right,top,bottom},scales:{y}}=ch;ctx.save();ctx.font='11px system-ui';ctx.lineWidth=1.5;(o.lines||[]).forEach(L=>{if(L.val==null)return;const py=y.getPixelForValue(L.val);if(py<top||py>bottom)return;ctx.setLineDash([6,4]);ctx.strokeStyle=L.color;ctx.beginPath();ctx.moveTo(left,py);ctx.lineTo(right,py);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=L.color;ctx.fillText(L.label,left+4,py-3);});ctx.restore();}});}
-kpis();render();ltvChart();
+kpis();render();
 </script></body></html>`;
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
@@ -968,10 +977,10 @@ function htmlResponse(rows) {
   .charts{display:flex;flex-wrap:wrap;gap:16px;margin-bottom:1rem}
   .chartbox{flex:1;min-width:320px;height:300px;border:1px solid #eee;border-radius:6px;padding:8px}
   .chartbox h3{margin:.2rem 0 .4rem;font-size:13px;color:#333;font-weight:600}
-  .wrap{overflow-x:auto}
+  .wrap{overflow:auto;max-height:78vh}
   table{border-collapse:collapse;width:100%;font-size:12px}
   th,td{border:1px solid #ddd;padding:5px 7px;white-space:nowrap;vertical-align:top}
-  th{background:#f4f4f4;text-align:left;cursor:pointer}
+  th{background:#f4f4f4;text-align:left;cursor:pointer;position:sticky;top:0;z-index:2}
   td.n{text-align:right}
   td.prop{white-space:normal;min-width:180px}
   td.rev-cell{white-space:normal;min-width:240px;max-width:340px;color:#b45309}
@@ -984,6 +993,7 @@ function htmlResponse(rows) {
   <label>Type<br><select id="fType" multiple size="2">
       <option value="acquisition">Acquisition</option>
       <option value="disposal">Disposal</option></select></label>
+  <label>REIT<br><select id="fReit" multiple size="4"></select></label>
   <label>City<br><select id="fCity" multiple size="4"></select></label>
   <label>Ward<br><select id="fWard" multiple size="4"></select></label>
   <div style="display:flex;flex-direction:column;gap:4px">
@@ -1018,6 +1028,7 @@ function splitLoc(loc){
 }
 DATA.forEach(r=>{ const s=splitLoc(r.location); r._city=s.city; r._ward=s.ward; });
 const fType=document.getElementById('fType');
+const fReit=document.getElementById('fReit');
 const fCity=document.getElementById('fCity');
 const fWard=document.getElementById('fWard');
 const selected = sel => [...sel.selectedOptions].map(o=>o.value);
@@ -1029,6 +1040,7 @@ function fillSelect(sel, values){
 }
 const cities = [...new Set(DATA.map(r=>r._city).filter(Boolean))].sort();
 fillSelect(fCity, cities);
+fillSelect(fReit, [...new Set(DATA.map(r=>r.reit_name).filter(Boolean))].sort());
 function refreshWards(){
   const cs=selected(fCity);
   const wards=[...new Set(DATA
@@ -1042,12 +1054,13 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
   {maxZoom:19, attribution:'© OpenStreetMap'}).addTo(map);
 let markers = [];
 function apply(){
-  const types=selected(fType), cs=selected(fCity), ws=selected(fWard);
+  const types=selected(fType), rt=selected(fReit), cs=selected(fCity), ws=selected(fWard);
   const clean=document.getElementById('fClean').checked;
   const dataOnly=document.getElementById('fData').checked;
   const q=document.getElementById('fText').value.toLowerCase();
   const rows = DATA.filter(r=>{
     if(types.length && !types.includes(r.transaction_type)) return false;
+    if(rt.length && !rt.includes(r.reit_name)) return false;
     if(cs.length && !cs.includes(r._city)) return false;
     if(ws.length && !ws.includes(r._ward)) return false;
     if(clean && r.needs_review) return false;
@@ -1170,11 +1183,11 @@ function renderCharts(rows){
       scales:{y:{title:{display:true,text:'¥bn'}}}}});
 }
 fCity.addEventListener('change', ()=>{ refreshWards(); apply(); });
-['fType','fWard','fClean','fData','fText'].forEach(id=>{
+['fType','fReit','fWard','fClean','fData','fText'].forEach(id=>{
   document.getElementById(id).addEventListener('input',apply);
 });
 document.getElementById('fReset').addEventListener('click', ()=>{
-  [fType,fCity,fWard].forEach(s=>[...s.options].forEach(o=>o.selected=false));
+  [fType,fReit,fCity,fWard].forEach(s=>[...s.options].forEach(o=>o.selected=false));
   document.getElementById('fClean').checked=false;
   document.getElementById('fData').checked=false;
   document.getElementById('fText').value='';
