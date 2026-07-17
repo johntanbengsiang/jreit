@@ -511,26 +511,57 @@ async function callGemini(promptText, pdfUrl, schema, env, pubdate, opts = {}) {
 }
 
 // ============================================================================
-async function fetchPdfAsBase64(pdfUrl, pubdate, maxBytes = MAX_PDF_BYTES) {
-  let res;
-  try {
-    res = await fetch(pdfUrl, { redirect: "follow", signal: AbortSignal.timeout(PDF_TIMEOUT_MS) });
-  } catch (e) { throw stageError("PDF fetch", e, PDF_TIMEOUT_MS); }
-  if (!res.ok) throw new Error(`[PDF fetch] HTTP ${res.status}`);
-  const ct = (res.headers.get("content-type") || "").toLowerCase();
-  if (!ct.includes("application/pdf")) {
-    const html = await res.text();
-    const m = html.match(/https?:\/\/[^"'\s)]+\.pdf/i);
-    if (!m) throw new Error("[PDF fetch] no PDF at URL (source expired)");
-    let p;
-    try {
-      p = await fetch(m[0], { redirect: "follow", signal: AbortSignal.timeout(PDF_TIMEOUT_MS) });
-    } catch (e) { throw stageError("PDF fetch", e, PDF_TIMEOUT_MS); }
-    if (!p.ok || !(p.headers.get("content-type") || "").toLowerCase().includes("pdf"))
-      throw new Error("[PDF fetch] linked PDF unavailable");
-    return { base64: await toBase64(p, maxBytes), sourceUrl: m[0] };
+// Browser-like headers: TDnet (release.tdnet.info) blocks/redirects datacenter
+// requests that don't look like a browser, which was making most PDF fetches
+// fall back to title-only. A UA + Accept + Referer clears the bulk of them.
+const PDF_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept": "application/pdf,application/octet-stream,text/html;q=0.8,*/*;q=0.5",
+  "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+  "Referer": "https://www.release.tdnet.info/",
+};
+
+// Unwrap Yanoshin's redirect wrapper (…/rd.php?<real-url>) so we hit the TDnet
+// PDF directly — one less hop, and it lets us send a matching Referer.
+function unwrapPdfUrl(u) {
+  const i = u.indexOf("rd.php?");
+  if (i !== -1) {
+    const inner = u.slice(i + 7);
+    if (/^https?:\/\//i.test(inner)) { try { return decodeURIComponent(inner); } catch (e) { return inner; } }
   }
-  return { base64: await toBase64(res, maxBytes), sourceUrl: pdfUrl };
+  return u;
+}
+
+function fetchWithUA(url) {
+  return fetch(url, { redirect: "follow", headers: PDF_HEADERS, signal: AbortSignal.timeout(PDF_TIMEOUT_MS) });
+}
+
+async function fetchPdfAsBase64(pdfUrl, pubdate, maxBytes = MAX_PDF_BYTES) {
+  const direct = unwrapPdfUrl(pdfUrl);
+  // Try the unwrapped/direct URL first, then the original wrapper as a fallback.
+  const candidates = direct === pdfUrl ? [pdfUrl] : [direct, pdfUrl];
+  let res, lastErr;
+  for (const url of candidates) {
+    try {
+      const r = await fetchWithUA(url);
+      if (r.ok) { res = r; break; }
+      lastErr = new Error(`[PDF fetch] HTTP ${r.status}`);
+    } catch (e) { lastErr = stageError("PDF fetch", e, PDF_TIMEOUT_MS); }
+  }
+  if (!res) throw lastErr || new Error("[PDF fetch] unreachable");
+  const ct = (res.headers.get("content-type") || "").toLowerCase();
+  if (ct.includes("pdf") || ct.includes("octet-stream")) {
+    return { base64: await toBase64(res, maxBytes), sourceUrl: res.url || direct };
+  }
+  // Not a PDF (HTML interstitial / block page): look for a .pdf link inside it.
+  const html = await res.text();
+  const m = html.match(/https?:\/\/[^"'\s)]+\.pdf/i);
+  if (!m) throw new Error("[PDF fetch] no PDF at URL (blocked or source expired)");
+  let p;
+  try { p = await fetchWithUA(m[0]); } catch (e) { throw stageError("PDF fetch", e, PDF_TIMEOUT_MS); }
+  if (!p.ok || !(p.headers.get("content-type") || "").toLowerCase().includes("pdf"))
+    throw new Error("[PDF fetch] linked PDF unavailable");
+  return { base64: await toBase64(p, maxBytes), sourceUrl: m[0] };
 }
 
 async function toBase64(res, maxBytes = MAX_PDF_BYTES) {
@@ -833,6 +864,33 @@ function render(rows){
   renderCharts(rows);
 }
 let scatterChart, barsChart;
+function median(arr){
+  const a=arr.filter(v=>v!=null && !isNaN(v)).sort((x,y)=>x-y);
+  if(!a.length) return null;
+  const m=Math.floor(a.length/2);
+  return a.length%2 ? a[m] : (a[m-1]+a[m])/2;
+}
+// Draws dashed median reference lines from options.plugins.medianLines
+const medianLines={
+  id:'medianLines',
+  afterDraw(chart){
+    const o=chart.options.plugins.medianLines; if(!o) return;
+    const {ctx,chartArea:{left,right,top,bottom},scales:{x,y}}=chart;
+    ctx.save(); ctx.font='11px system-ui'; ctx.lineWidth=1.5;
+    (o.hlines||[]).forEach(h=>{ if(h.val==null||!y) return; const py=y.getPixelForValue(h.val);
+      if(py<top||py>bottom) return;
+      ctx.setLineDash([6,4]); ctx.strokeStyle=h.color||'#111';
+      ctx.beginPath(); ctx.moveTo(left,py); ctx.lineTo(right,py); ctx.stroke();
+      ctx.setLineDash([]); ctx.fillStyle=h.color||'#111'; ctx.fillText(h.label,left+4,py-3); });
+    (o.vlines||[]).forEach(v=>{ if(v.val==null||!x) return; const px=x.getPixelForValue(v.val);
+      if(px<left||px>right) return;
+      ctx.setLineDash([6,4]); ctx.strokeStyle=v.color||'#111';
+      ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
+      ctx.setLineDash([]); ctx.fillStyle=v.color||'#111'; ctx.fillText(v.label,px+3,top+12); });
+    ctx.restore();
+  }
+};
+Chart.register(medianLines);
 function quarterOf(d){
   if(!d || d.length<7) return null;
   const y=d.slice(0,4), m=+d.slice(5,7); return y+" Q"+(Math.floor((m-1)/3)+1);
@@ -845,6 +903,8 @@ function renderCharts(rows){
       label:(r.property_name_en||r.property_name)};
     (r.transaction_type==='disposal'?dis:acq).push(pt);
   }
+  const allPts=acq.concat(dis);
+  const medPk=median(allPts.map(p=>p.y)), medYld=median(allPts.map(p=>p.x));
   const sctx=document.getElementById('scatter');
   if(scatterChart) scatterChart.destroy();
   scatterChart=new Chart(sctx,{type:'scatter',
@@ -852,7 +912,10 @@ function renderCharts(rows){
       {label:'Acquisition',data:acq,backgroundColor:'#2563eb'},
       {label:'Disposal',data:dis,backgroundColor:'#dc2626'}]},
     options:{maintainAspectRatio:false,
-      plugins:{tooltip:{callbacks:{label:c=>c.raw.label+': '+c.raw.y+'¥m/key, '+c.raw.x+'%'}}},
+      plugins:{tooltip:{callbacks:{label:c=>c.raw.label+': '+c.raw.y+'¥m/key, '+c.raw.x+'%'}},
+        medianLines:{
+          hlines: medPk==null?[]:[{val:medPk,label:'median '+medPk.toFixed(1)+' ¥m/key',color:'#111'}],
+          vlines: medYld==null?[]:[{val:medYld,label:'median '+medYld.toFixed(2)+'%',color:'#555'}]}},
       scales:{x:{title:{display:true,text:'Yield (%)'}},
               y:{title:{display:true,text:'Price / Key (¥m)'}}}}});
   const q={};
@@ -863,13 +926,19 @@ function renderCharts(rows){
     if(r.transaction_type==='disposal') q[key].d+=r.price_jpy; else q[key].a+=r.price_jpy;
   }
   const labels=Object.keys(q).sort();
+  const aVals=labels.map(k=>+(q[k].a/1e9).toFixed(2));
+  const dVals=labels.map(k=>+(q[k].d/1e9).toFixed(2));
+  const medA=median(aVals.filter(v=>v>0)), medD=median(dVals.filter(v=>v>0));
   const bctx=document.getElementById('bars');
   if(barsChart) barsChart.destroy();
   barsChart=new Chart(bctx,{type:'bar',
     data:{labels,datasets:[
-      {label:'Acquisitions',data:labels.map(k=>+(q[k].a/1e9).toFixed(2)),backgroundColor:'#2563eb'},
-      {label:'Disposals',data:labels.map(k=>+(q[k].d/1e9).toFixed(2)),backgroundColor:'#dc2626'}]},
+      {label:'Acquisitions',data:aVals,backgroundColor:'#2563eb'},
+      {label:'Disposals',data:dVals,backgroundColor:'#dc2626'}]},
     options:{maintainAspectRatio:false,
+      plugins:{medianLines:{hlines:[
+        ...(medA==null?[]:[{val:medA,label:'median acq '+medA.toFixed(2)+' ¥bn',color:'#2563eb'}]),
+        ...(medD==null?[]:[{val:medD,label:'median disp '+medD.toFixed(2)+' ¥bn',color:'#dc2626'}])]}},
       scales:{y:{title:{display:true,text:'¥bn'}}}}});
 }
 fCity.addEventListener('change', ()=>{ refreshWards(); apply(); });
