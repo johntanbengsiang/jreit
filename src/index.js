@@ -760,9 +760,9 @@ function reitsHtmlResponse(rows) {
  .kpi b{display:block;font-size:1.2rem}.kpi span{font-size:12px;color:#666}
  .controls{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:.6rem;font-size:13px;align-items:center}
  select,input{padding:4px 6px;font-size:13px}
- table{border-collapse:collapse;width:100%;font-size:12px}
- th,td{border:1px solid #ddd;padding:5px 7px;white-space:nowrap;vertical-align:top}
- th{background:#f4f4f4;text-align:left;cursor:pointer;position:sticky;top:0;z-index:2}
+ table{border-collapse:separate;border-spacing:0;width:100%;font-size:12px;border-top:1px solid #ddd;border-left:1px solid #ddd}
+ th,td{border-right:1px solid #ddd;border-bottom:1px solid #ddd;padding:5px 7px;white-space:nowrap;vertical-align:top}
+ th{background:#eef1f6;text-align:left;cursor:pointer;position:sticky;top:0;z-index:3}
  td.n{text-align:right}td.name{white-space:normal;min-width:190px}
  .pill{padding:1px 7px;border-radius:10px;font-size:11px}
  .p-pure{background:#dcfce7;color:#166534}.p-div{background:#dbeafe;color:#1e40af}.p-other{background:#f3f4f6;color:#374151}
@@ -818,10 +818,10 @@ function ltvChart(rows){
                   {val:wa,label:'hotel-AUM wtd avg '+(wa==null?'—':wa.toFixed(1)+'%'),color:'#7c3aed'}]}},
       scales:{y:{title:{display:true,text:'LTV %'}},x:{ticks:{font:{size:9},maxRotation:90,minRotation:90}}}}});
 }
-function kpis(){
-  const pure=D.filter(r=>r.category==='Pure-play hospitality').length;
-  const div=D.filter(r=>r.category==='Diversified — holds hotels').length;
-  const hh=D.filter(r=>r.hospitality_aum_bn>0);
+function kpis(rows){
+  const pure=rows.filter(r=>r.category==='Pure-play hospitality').length;
+  const div=rows.filter(r=>r.category==='Diversified — holds hotels').length;
+  const hh=rows.filter(r=>r.hospitality_aum_bn>0);
   const hAUM=hh.reduce((s,r)=>s+(r.hospitality_aum_bn||0),0);
   const rAUM=hh.reduce((s,r)=>s+(r.total_aum_bn||0),0);
   const wl=hh.filter(r=>r.ltv_pct!=null);
@@ -866,6 +866,7 @@ function render(){
       '<td class="n">'+deals+'</td><td>'+(r.as_of||'')+'</td>'+
       '<td class="name"><small>'+(r.note||'')+((r.note&&src)?' · ':'')+src+'</small></td></tr>';
   }).join('');
+  kpis(rows);
   ltvChart(rows);
 }
 document.querySelectorAll('th[data-k]').forEach(th=>th.onclick=()=>{const k=th.dataset.k;
@@ -873,7 +874,7 @@ document.querySelectorAll('th[data-k]').forEach(th=>th.onclick=()=>{const k=th.d
 ['fCat','fSec','fHotel'].forEach(id=>document.getElementById(id).addEventListener('change',render));
 document.getElementById('fText').addEventListener('input',render);
 if(typeof Chart!=='undefined'){Chart.register({id:'med',afterDraw(ch){const o=ch.options.plugins.med;if(!o)return;const{ctx,chartArea:{left,right,top,bottom},scales:{y}}=ch;ctx.save();ctx.font='11px system-ui';ctx.lineWidth=1.5;(o.lines||[]).forEach(L=>{if(L.val==null)return;const py=y.getPixelForValue(L.val);if(py<top||py>bottom)return;ctx.setLineDash([6,4]);ctx.strokeStyle=L.color;ctx.beginPath();ctx.moveTo(left,py);ctx.lineTo(right,py);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=L.color;ctx.fillText(L.label,left+4,py-3);});ctx.restore();}});}
-kpis();render();
+render();
 </script></body></html>`;
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
@@ -977,10 +978,10 @@ function htmlResponse(rows) {
   .charts{display:flex;flex-wrap:wrap;gap:16px;margin-bottom:1rem}
   .chartbox{flex:1;min-width:320px;height:300px;border:1px solid #eee;border-radius:6px;padding:8px}
   .chartbox h3{margin:.2rem 0 .4rem;font-size:13px;color:#333;font-weight:600}
-  .wrap{overflow:auto;max-height:78vh}
-  table{border-collapse:collapse;width:100%;font-size:12px}
-  th,td{border:1px solid #ddd;padding:5px 7px;white-space:nowrap;vertical-align:top}
-  th{background:#f4f4f4;text-align:left;cursor:pointer;position:sticky;top:0;z-index:2}
+  .wrap{overflow:auto;max-height:80vh}
+  table{border-collapse:separate;border-spacing:0;width:100%;font-size:12px;border-top:1px solid #ddd;border-left:1px solid #ddd}
+  th,td{border-right:1px solid #ddd;border-bottom:1px solid #ddd;padding:5px 7px;white-space:nowrap;vertical-align:top}
+  th{background:#eef1f6;text-align:left;cursor:pointer;position:sticky;top:0;z-index:3}
   td.n{text-align:right}
   td.prop{white-space:normal;min-width:180px}
   td.rev-cell{white-space:normal;min-width:240px;max-width:340px;color:#b45309}
