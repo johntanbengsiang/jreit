@@ -1,6 +1,6 @@
 {
   // Cloudflare Worker config for the J-REIT hotel transaction tracker.
-  "name": "hotel-triage-worker",
+  "name": "jreits",
   "main": "src/index.js",
   "compatibility_date": "2026-07-15",
 
