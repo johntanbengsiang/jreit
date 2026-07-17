@@ -14,12 +14,12 @@ jobs:
       - name: Run extraction + triage
         run: |
           curl -sS --fail-with-body \
-            "https://hotel-triage-worker.dispatch-news.workers.dev/run" || true
+            "https://jreits.nhtw.workers.dev/run" || true
       - name: Discover new filings (hourly-ish)
         if: ${{ github.event.schedule == '*/10 * * * *' }}
         run: |
           # only hit /discover when the minute is ~00 to avoid over-calling the API
           MIN=$(date -u +%M)
           if [ "$MIN" -lt 10 ]; then
-            curl -sS "https://hotel-triage-worker.dispatch-news.workers.dev/discover" || true
+            curl -sS "https://jreits.nhtw.workers.dev/discover" || true
           fi
