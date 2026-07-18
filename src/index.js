@@ -761,9 +761,9 @@ function reitsHtmlResponse(rows) {
  .controls{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:.6rem;font-size:13px;align-items:center}
  select,input{padding:4px 6px;font-size:13px}
  table{border-collapse:separate;border-spacing:0;width:100%;font-size:12px;border-top:1px solid #ddd;border-left:1px solid #ddd}
- th,td{border-right:1px solid #ddd;border-bottom:1px solid #ddd;padding:5px 7px;white-space:nowrap;vertical-align:top}
+ th,td{border-right:1px solid #ddd;border-bottom:1px solid #ddd;padding:4px 6px;white-space:nowrap;vertical-align:top}
  th{background:#eef1f6;text-align:left;cursor:pointer;position:sticky;top:0;z-index:3}
- td.n{text-align:right}td.name{white-space:normal;min-width:190px}
+ td.n{text-align:right}td.name{white-space:normal;min-width:130px;max-width:190px}
  .pill{padding:1px 7px;border-radius:10px;font-size:11px}
  .p-pure{background:#dcfce7;color:#166534}.p-div{background:#dbeafe;color:#1e40af}.p-other{background:#f3f4f6;color:#374151}
  .bar{height:9px;background:#2563eb;border-radius:3px;display:inline-block;vertical-align:middle;margin-left:6px}
@@ -782,7 +782,7 @@ function reitsHtmlResponse(rows) {
   <label>Search<br><input id="fText" placeholder="REIT / code…"></label>
   <a class="tab" href="/reits.csv">Download CSV</a>
 </div>
-<div style="overflow:auto;max-height:78vh"><table id="t"><thead><tr>
+<div style="overflow:visible"><table id="t"><thead><tr>
  <th data-k="code">Code</th><th data-k="name_en">REIT</th><th data-k="category">Category</th>
  <th data-k="primary_sector">Sector</th><th data-k="ltv_pct">LTV %</th>
  <th data-k="total_aum_bn">REIT AUM ¥bn</th><th data-k="hospitality_aum_bn">Hotel-only AUM ¥bn</th>
@@ -978,13 +978,15 @@ function htmlResponse(rows) {
   .charts{display:flex;flex-wrap:wrap;gap:16px;margin-bottom:1rem}
   .chartbox{flex:1;min-width:320px;height:300px;border:1px solid #eee;border-radius:6px;padding:8px}
   .chartbox h3{margin:.2rem 0 .4rem;font-size:13px;color:#333;font-weight:600}
-  .wrap{overflow:auto;max-height:80vh}
+  .wrap{overflow:visible}
   table{border-collapse:separate;border-spacing:0;width:100%;font-size:12px;border-top:1px solid #ddd;border-left:1px solid #ddd}
-  th,td{border-right:1px solid #ddd;border-bottom:1px solid #ddd;padding:5px 7px;white-space:nowrap;vertical-align:top}
+  th,td{border-right:1px solid #ddd;border-bottom:1px solid #ddd;padding:4px 6px;white-space:nowrap;vertical-align:top}
   th{background:#eef1f6;text-align:left;cursor:pointer;position:sticky;top:0;z-index:3}
   td.n{text-align:right}
-  td.prop{white-space:normal;min-width:180px}
-  td.rev-cell{white-space:normal;min-width:240px;max-width:340px;color:#b45309}
+  td.reit{white-space:normal;max-width:120px;min-width:84px}
+  td.loc{white-space:normal;max-width:120px}
+  td.prop{white-space:normal;min-width:150px;max-width:220px}
+  td.rev-cell{white-space:normal;min-width:150px;max-width:240px;color:#b45309}
   tr.rev{background:#fff7ed}
   .muted{color:#666;font-size:12px}
 </style></head><body>
@@ -1084,9 +1086,9 @@ function render(rows){
     tr.innerHTML='<td>'+r.pubdate+'</td>'+
       '<td>'+(r.pdf_url?'<a href="'+r.pdf_url+'" target="_blank">view</a>':'')+
         (r.archive_url?' · <a href="'+r.archive_url+'" target="_blank" title="Archived copy in Google Drive">📁</a>':'')+'</td>'+
-      '<td>'+r.reit_name+'</td><td class="prop">'+prop+'</td><td>'+r.transaction_type+'</td>'+
+      '<td class="reit">'+r.reit_name+'</td><td class="prop">'+prop+'</td><td>'+r.transaction_type+'</td>'+
       '<td class="n">'+(r.num_rooms??'')+'</td><td class="n">'+(r.gfa_sqm?fmt(r.gfa_sqm):'')+stake+'</td>'+
-      '<td class="n">'+fmt(r.price_jpy)+'</td><td>'+r.location+'</td>'+
+      '<td class="n">'+fmt(r.price_jpy)+'</td><td class="loc">'+r.location+'</td>'+
       '<td class="n">'+(r.yield_pct!=null?num(r.yield_pct,2)+'%':'')+'</td>'+
       '<td class="n">'+fmt(r.appraisal_jpy)+'</td>'+
       '<td class="n">'+(r.appr_premium?r.appr_premium.toFixed(2)+'x':'')+'</td>'+
